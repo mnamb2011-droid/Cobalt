@@ -16,6 +16,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -47,6 +48,8 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
@@ -77,12 +80,13 @@ private val BorderSubtle = Color(0xFF283A57)
 private val Accent = Color(0xFF2EE6CE)
 private val AccentDark = Color(0xFF062925)
 private val YoutubeRed = Color(0xFFFF3D57)
+private val KodiBlue = Color(0xFF29B6F6)
 private val Danger = Color(0xFFFF5C72)
 private val Warning = Color(0xFFFFC861)
 private val TextPrimary = Color(0xFFF3F6FB)
 private val TextMuted = Color(0xFF94A3B8)
 
-private enum class RemoteTab { REMOTE, APPS }
+private enum class RemoteTab { REMOTE, KODI, APPS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -116,12 +120,26 @@ class MainActivity : ComponentActivity() {
                             savedIp = prefs.getString("tv_ip", "") ?: "",
                             savedKey = secure.read("client_key"),
                             savedFingerprint = prefs.getString("tv_fingerprint", null),
+                            savedKodiPort = prefs.getInt("kodi_port", 8080),
+                            savedKodiUser = prefs.getString("kodi_user", "kodi") ?: "kodi",
+                            savedKodiPass = secure.read("kodi_pass") ?: "",
+                            savedKodiMoviesJson = prefs.getString("kodi_movies_cache", null),
                             onSave = { ip, key, fp ->
                                 prefs.edit()
                                     .putString("tv_ip", ip)
                                     .putString("tv_fingerprint", fp)
                                     .apply()
                                 secure.write("client_key", key)
+                            },
+                            onSaveKodi = { port, user, pass ->
+                                prefs.edit()
+                                    .putInt("kodi_port", port)
+                                    .putString("kodi_user", user)
+                                    .apply()
+                                if (pass.isNotEmpty()) secure.write("kodi_pass", pass) else secure.remove("kodi_pass")
+                            },
+                            onCacheKodiMovies = { json ->
+                                prefs.edit().putString("kodi_movies_cache", json).apply()
                             },
                             onClear = {
                                 secure.remove("client_key")
@@ -304,13 +322,14 @@ private fun fallbackIconForApp(app: TvApp): ImageVector {
     val key = "${app.id} ${app.title}".lowercase()
     return when {
         "youtube" in key || "cobalt" in key -> Icons.Rounded.SmartDisplay
+        "kodi" in key || "xbmc" in key -> Icons.Rounded.LocalMovies
         "netflix" in key || "prime" in key || "shahid" in key || "disney" in key || "watch" in key -> Icons.Rounded.Movie
         "browser" in key || "web" in key -> Icons.Rounded.Public
         "setting" in key -> Icons.Rounded.Settings
         "livetv" in key || "tv" in key -> Icons.Rounded.LiveTv
         "hdmi" in key || "input" in key -> Icons.Rounded.SettingsInputHdmi
         "music" in key || "spotify" in key || "audio" in key -> Icons.Rounded.MusicNote
-        "photo" in key || "media" in key || "video" in key || "kodi" in key || "plex" in key -> Icons.Rounded.PermMedia
+        "photo" in key || "media" in key || "video" in key || "plex" in key -> Icons.Rounded.PermMedia
         "store" in key || "discovery" in key || "content" in key -> Icons.Rounded.ShoppingBag
         "game" in key -> Icons.Rounded.SportsEsports
         else -> Icons.Rounded.Apps
@@ -322,7 +341,13 @@ private fun RemoteScreen(
     savedIp: String,
     savedKey: String?,
     savedFingerprint: String?,
+    savedKodiPort: Int,
+    savedKodiUser: String,
+    savedKodiPass: String,
+    savedKodiMoviesJson: String?,
     onSave: (String, String, String?) -> Unit,
+    onSaveKodi: (Int, String, String) -> Unit,
+    onCacheKodiMovies: (String) -> Unit,
     onClear: () -> Unit
 ) {
     val context = LocalContext.current
@@ -346,17 +371,37 @@ private fun RemoteScreen(
     var showConnectionPanel by remember { mutableStateOf(savedIp.isBlank()) }
     var connectJob by remember { mutableStateOf<Job?>(null) }
 
-    // In-app YouTube Search Results Sheet state
+    // Kodi Movies Library State
+    var kodiPortText by remember { mutableStateOf(savedKodiPort.toString()) }
+    var kodiUser by remember { mutableStateOf(savedKodiUser) }
+    var kodiPass by remember { mutableStateOf(savedKodiPass) }
+    var showKodiSettings by remember { mutableStateOf(false) }
+    var kodiMovies by remember { mutableStateOf(KodiClient.deserializeMovies(savedKodiMoviesJson)) }
+    var kodiFilter by remember { mutableStateOf("") }
+    var kodiLoading by remember { mutableStateOf(false) }
+    var kodiStatus by remember { mutableStateOf<String?>(null) }
+
+    // YouTube Search Dialog State
     var showYtDialog by remember { mutableStateOf(false) }
     var ytSearching by remember { mutableStateOf(false) }
     var ytSearchQuery by remember { mutableStateOf("") }
     var ytResults by remember { mutableStateOf<List<YouTubeSearchResult>>(emptyList()) }
     var ytError by remember { mutableStateOf<String?>(null) }
 
-    // Custom Coil ImageLoader that trusts the TV's self-signed TLS certificate so TV app icons load!
     val tvImageLoader = remember(client) {
         ImageLoader.Builder(context).apply {
             client?.let { okHttpClient(it.imageHttpClient()) }
+        }.build()
+    }
+
+    val kodiClient = remember(ip, kodiPortText, kodiUser, kodiPass) {
+        val port = kodiPortText.toIntOrNull()?.coerceIn(1, 65535) ?: 8080
+        if (ip.isBlank()) null else KodiClient(ip.trim(), port, kodiUser.trim(), kodiPass)
+    }
+
+    val kodiImageLoader = remember(kodiClient) {
+        ImageLoader.Builder(context).apply {
+            kodiClient?.let { okHttpClient(it.imageHttpClient()) }
         }.build()
     }
 
@@ -380,13 +425,86 @@ private fun RemoteScreen(
         ) {
             return foregroundId
         }
-        apps.firstOrNull {
-            it.id.contains("cobalt", true) || it.title.contains("cobalt", true)
-        }?.let { return it.id }
-        apps.firstOrNull {
-            it.id.contains("youtube", true) || it.title.contains("youtube", true)
-        }?.let { return it.id }
+        apps.firstOrNull { it.id.contains("cobalt", true) || it.title.contains("cobalt", true) }?.let { return it.id }
+        apps.firstOrNull { it.id.contains("youtube", true) || it.title.contains("youtube", true) }?.let { return it.id }
         return "youtube.leanback.v4"
+    }
+
+    fun resolveKodiAppId(): String {
+        apps.firstOrNull {
+            it.id.contains("kodi", true) || it.id.contains("xbmc", true) || it.title.contains("kodi", true)
+        }?.let { return it.id }
+        return "org.xbmc.kodi"
+    }
+
+    /** Ensures Kodi is running on the LG TV (auto-launches it if closed) and waits until JSON-RPC answers. */
+    suspend fun ensureKodiReady(kodi: KodiClient): Boolean {
+        if (kodi.ping()) return true
+        val tv = client ?: return false
+        kodiStatus = "جارٍ تشغيل كودي على التلفزيون…"
+        runCatching { tv.launchApp(resolveKodiAppId()) }
+        repeat(18) {
+            delay(850)
+            if (kodi.ping()) return true
+        }
+        return false
+    }
+
+    fun refreshKodiMovies(autoLaunch: Boolean = false) {
+        val kodi = kodiClient ?: run {
+            kodiStatus = "اتصل بالتلفزيون أولاً"
+            return
+        }
+        scope.launch {
+            kodiLoading = true
+            kodiStatus = "جارٍ جلب أفلام كودي…"
+            val ready = if (autoLaunch) ensureKodiReady(kodi) else kodi.ping()
+            if (!ready) {
+                kodiLoading = false
+                kodiStatus = "كودي غير متصل — افتح كودي وفعّل التحكم عبر HTTP في الإعدادات ← الخدمات ← التحكم"
+                showKodiSettings = true
+                return@launch
+            }
+            runCatching { kodi.getMovies() }
+                .onSuccess { list ->
+                    kodiMovies = list
+                    onCacheKodiMovies(KodiClient.serializeMovies(list))
+                    kodiStatus = if (list.isEmpty()) "مكتبة الأفلام في كودي فارغة" else "تم تحديث ${list.size} فيلم من كودي"
+                }
+                .onFailure { err ->
+                    kodiStatus = err.message ?: "تعذر قراءة أفلام كودي"
+                    showKodiSettings = true
+                }
+            kodiLoading = false
+        }
+    }
+
+    fun playKodiMovieDirectly(movie: KodiMovie) {
+        val kodi = kodiClient ?: run {
+            status = "اتصل بالتلفزيون أولاً"
+            return
+        }
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        scope.launch {
+            kodiLoading = true
+            kodiStatus = "جارٍ تشغيل: ${movie.title}…"
+            val ready = ensureKodiReady(kodi)
+            if (!ready) {
+                kodiLoading = false
+                kodiStatus = "تعذر الوصول إلى كودي — تأكد من تفعيل (السماح بالتحكم عن بُعد عبر HTTP) في كودي"
+                showKodiSettings = true
+                return@launch
+            }
+            runCatching { kodi.playMovie(movie.movieId, movie.file) }
+                .onSuccess {
+                    status = "يُعرض الآن في كودي: ${movie.title}"
+                    kodiStatus = "تم تشغيل الفيلم على الشاشة: ${movie.title}"
+                }
+                .onFailure { err ->
+                    kodiStatus = "تعذر تشغيل الفيلم: ${err.message}"
+                }
+            kodiLoading = false
+        }
     }
 
     fun connect(address: String, fallbackToDiscovery: Boolean = false) {
@@ -532,10 +650,6 @@ private fun RemoteScreen(
         }
     }
 
-    // Smart Submit:
-    // 1) Direct YouTube URL -> plays immediately on Cobalt TV
-    // 2) Native webOS IME active -> sends text + Enter
-    // 3) Search query -> searches YouTube right on phone and opens clickable results to play on Cobalt TV!
     fun submitTextOrYouTubeSearch(forceYouTube: Boolean = false) {
         val query = typed.trim()
         if (query.isEmpty()) {
@@ -561,7 +675,6 @@ private fun RemoteScreen(
             return
         }
 
-        // Open in-app YouTube Search Results so the user picks any video to play immediately on Cobalt!
         ytSearchQuery = query
         showYtDialog = true
         ytSearching = true
@@ -740,7 +853,7 @@ private fun RemoteScreen(
             }
         }
 
-        // 3. Mode Switcher (Remote vs Apps)
+        // 3. 3-Tab Mode Switcher (Remote | Kodi Movies | TV Apps)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -750,15 +863,31 @@ private fun RemoteScreen(
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             TabPill(
-                label = "الريموت والمؤشر",
+                label = "الريموت",
                 icon = Icons.Rounded.SettingsRemote,
                 selected = activeTab == RemoteTab.REMOTE,
+                accentColor = Accent,
                 modifier = Modifier.weight(1f)
             ) { activeTab = RemoteTab.REMOTE }
+
             TabPill(
-                label = "التطبيقات (${apps.size})",
+                label = if (kodiMovies.isNotEmpty()) "أفلام كودي (${kodiMovies.size})" else "أفلام كودي",
+                icon = Icons.Rounded.LocalMovies,
+                selected = activeTab == RemoteTab.KODI,
+                accentColor = KodiBlue,
+                modifier = Modifier.weight(1.2f)
+            ) {
+                activeTab = RemoteTab.KODI
+                if (kodiMovies.isEmpty() && !kodiLoading && ip.isNotBlank()) {
+                    refreshKodiMovies(autoLaunch = false)
+                }
+            }
+
+            TabPill(
+                label = "التطبيقات",
                 icon = Icons.Rounded.Apps,
                 selected = activeTab == RemoteTab.APPS,
+                accentColor = Accent,
                 modifier = Modifier.weight(1f)
             ) {
                 activeTab = RemoteTab.APPS
@@ -767,99 +896,230 @@ private fun RemoteScreen(
         }
 
         // 4. Main Content Area
-        if (activeTab == RemoteTab.REMOTE) {
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                // D-Pad ON TOP
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+        when (activeTab) {
+            RemoteTab.REMOTE -> {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        SideNavButton(Icons.AutoMirrored.Rounded.ArrowBack, "رجوع") { command { it.button("BACK") } }
-                        SideNavButton(Icons.Rounded.Close, "خروج") { command { it.button("EXIT") } }
+                    // D-Pad ON TOP
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            SideNavButton(Icons.AutoMirrored.Rounded.ArrowBack, "رجوع") { command { it.button("BACK") } }
+                            SideNavButton(Icons.Rounded.Close, "خروج") { command { it.button("EXIT") } }
+                        }
+
+                        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                            Box(
+                                modifier = Modifier
+                                    .size(196.dp)
+                                    .clip(CircleShape)
+                                    .background(SurfaceCard)
+                                    .border(1.5.dp, BorderSubtle, CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                DpadArrow(Icons.Rounded.KeyboardArrowUp, Modifier.align(Alignment.TopCenter).padding(top = 6.dp)) { command { it.button("UP") } }
+                                DpadArrow(Icons.Rounded.KeyboardArrowDown, Modifier.align(Alignment.BottomCenter).padding(bottom = 6.dp)) { command { it.button("DOWN") } }
+                                DpadArrow(Icons.Rounded.KeyboardArrowLeft, Modifier.align(Alignment.CenterStart).padding(start = 6.dp)) { command { it.button("LEFT") } }
+                                DpadArrow(Icons.Rounded.KeyboardArrowRight, Modifier.align(Alignment.CenterEnd).padding(end = 6.dp)) { command { it.button("RIGHT") } }
+
+                                Box(
+                                    modifier = Modifier
+                                        .size(72.dp)
+                                        .clip(CircleShape)
+                                        .background(Brush.linearGradient(listOf(Accent, Color(0xFF14B8A6))))
+                                        .clickable { command { it.button("ENTER") } },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text("OK", color = AccentDark, fontWeight = FontWeight.Black, fontSize = 17.sp)
+                                }
+                            }
+                        }
+
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            SideNavButton(Icons.Rounded.Home, "الرئيسية") { command { it.button("HOME") } }
+                            SideNavButton(Icons.Rounded.Menu, "القائمة") { command { it.button("MENU") } }
+                        }
                     }
 
-                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    // Touchpad + Dedicated Magic-Remote Scroll Wheel Replacement BELOW D-Pad!
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .heightIn(min = 120.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // Touchpad
                         Box(
                             modifier = Modifier
-                                .size(196.dp)
-                                .clip(CircleShape)
-                                .background(SurfaceCard)
-                                .border(1.5.dp, BorderSubtle, CircleShape),
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(22.dp))
+                                .background(Brush.verticalGradient(listOf(SurfaceElevated, SurfaceCard)))
+                                .border(1.dp, BorderSubtle, RoundedCornerShape(22.dp))
+                                .pointerInput(client) {
+                                    detectDragGestures { change, drag ->
+                                        change.consume()
+                                        client?.movePointer((drag.x * 1.15f).toInt(), (drag.y * 1.15f).toInt())
+                                    }
+                                }
+                                .pointerInput(client) {
+                                    detectTapGestures(
+                                        onTap = {
+                                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            client?.clickPointer()
+                                        },
+                                        onLongPress = {
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            client?.clickPointer()
+                                        }
+                                    )
+                                },
                             contentAlignment = Alignment.Center
                         ) {
-                            DpadArrow(Icons.Rounded.KeyboardArrowUp, Modifier.align(Alignment.TopCenter).padding(top = 6.dp)) { command { it.button("UP") } }
-                            DpadArrow(Icons.Rounded.KeyboardArrowDown, Modifier.align(Alignment.BottomCenter).padding(bottom = 6.dp)) { command { it.button("DOWN") } }
-                            DpadArrow(Icons.Rounded.KeyboardArrowLeft, Modifier.align(Alignment.CenterStart).padding(start = 6.dp)) { command { it.button("LEFT") } }
-                            DpadArrow(Icons.Rounded.KeyboardArrowRight, Modifier.align(Alignment.CenterEnd).padding(end = 6.dp)) { command { it.button("RIGHT") } }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Icon(Icons.Rounded.TouchApp, contentDescription = null, tint = Accent.copy(alpha = 0.65f), modifier = Modifier.size(28.dp))
+                                Text("لوحة لمس المؤشر", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = TextPrimary)
+                                Text("اسحب للتحريك • انقر للاختيار", fontSize = 11.sp, color = TextMuted)
+                            }
+                        }
+
+                        // Dedicated Vertical Scroll Wheel (LG Magic Remote Wheel Replacement)
+                        Column(
+                            modifier = Modifier
+                                .width(64.dp)
+                                .fillMaxHeight()
+                                .clip(RoundedCornerShape(22.dp))
+                                .background(SurfaceCard)
+                                .border(1.dp, Accent.copy(alpha = 0.4f), RoundedCornerShape(22.dp))
+                                .padding(vertical = 4.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            IconButton(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    client?.scrollPointer(120)
+                                },
+                                modifier = Modifier.size(34.dp)
+                            ) {
+                                Icon(Icons.Rounded.KeyboardArrowUp, contentDescription = "تمرير لأعلى", tint = Accent, modifier = Modifier.size(24.dp))
+                            }
 
                             Box(
                                 modifier = Modifier
-                                    .size(72.dp)
-                                    .clip(CircleShape)
-                                    .background(Brush.linearGradient(listOf(Accent, Color(0xFF14B8A6))))
-                                    .clickable { command { it.button("ENTER") } },
+                                    .weight(1f)
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 8.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(SurfaceElevated)
+                                    .pointerInput(client) {
+                                        var acc = 0f
+                                        detectVerticalDragGestures(
+                                            onDragEnd = { acc = 0f },
+                                            onVerticalDrag = { change, dragAmount ->
+                                                change.consume()
+                                                acc += dragAmount
+                                                if (kotlin.math.abs(acc) >= 22f) {
+                                                    val step = if (acc < 0f) 100 else -100
+                                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                    client?.scrollPointer(step)
+                                                    acc = 0f
+                                                }
+                                            }
+                                        )
+                                    },
                                 contentAlignment = Alignment.Center
                             ) {
-                                Text("OK", color = AccentDark, fontWeight = FontWeight.Black, fontSize = 17.sp)
-                            }
-                        }
-                    }
-
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        SideNavButton(Icons.Rounded.Home, "الرئيسية") { command { it.button("HOME") } }
-                        SideNavButton(Icons.Rounded.Menu, "القائمة") { command { it.button("MENU") } }
-                    }
-                }
-
-                // Touchpad BELOW D-Pad
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f)
-                        .heightIn(min = 110.dp)
-                        .clip(RoundedCornerShape(22.dp))
-                        .background(Brush.verticalGradient(listOf(SurfaceElevated, SurfaceCard)))
-                        .border(1.dp, BorderSubtle, RoundedCornerShape(22.dp))
-                        .pointerInput(client) {
-                            detectDragGestures { change, drag ->
-                                change.consume()
-                                client?.movePointer((drag.x * 1.15f).toInt(), (drag.y * 1.15f).toInt())
-                            }
-                        }
-                        .pointerInput(client) {
-                            detectTapGestures(
-                                onTap = {
-                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    client?.clickPointer()
-                                },
-                                onLongPress = {
-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    client?.clickPointer()
+                                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                                    Icon(Icons.Rounded.UnfoldMore, contentDescription = "بكرة التمرير", tint = Accent, modifier = Modifier.size(20.dp))
+                                    Text("بكرة", fontSize = 10.sp, color = TextMuted, fontWeight = FontWeight.SemiBold)
                                 }
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    client?.scrollPointer(-120)
+                                },
+                                modifier = Modifier.size(34.dp)
+                            ) {
+                                Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "تمرير لأسفل", tint = Accent, modifier = Modifier.size(24.dp))
+                            }
+                        }
+                    }
+
+                    // Volume & Media Control Card
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(SurfaceCard)
+                            .border(1.dp, BorderSubtle, RoundedCornerShape(18.dp))
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            SmallIconKey(Icons.Rounded.VolumeOff, "كتم") { command { it.button("MUTE") } }
+                            SmallIconKey(Icons.Rounded.VolumeDown, "خفض الصوت") {
+                                volume = (volume - 2f).coerceAtLeast(0f)
+                                command { it.button("VOLUMEDOWN") }
+                            }
+                            Slider(
+                                value = volume,
+                                onValueChange = { volume = it },
+                                onValueChangeFinished = { command(false) { it.setVolume(volume.toInt()) } },
+                                valueRange = 0f..100f,
+                                modifier = Modifier.weight(1f),
+                                colors = SliderDefaults.colors(
+                                    thumbColor = Accent,
+                                    activeTrackColor = Accent,
+                                    inactiveTrackColor = BorderSubtle
+                                )
                             )
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Icon(Icons.Rounded.TouchApp, contentDescription = null, tint = Accent.copy(alpha = 0.65f), modifier = Modifier.size(28.dp))
-                        Text("لوحة لمس مؤشر التلفزيون", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = TextPrimary)
-                        Text("اسحب لتحريك المؤشر • انقر للاختيار", fontSize = 11.sp, color = TextMuted)
+                            Text(
+                                text = "${volume.toInt()}%",
+                                color = TextPrimary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.width(34.dp),
+                                textAlign = TextAlign.Center
+                            )
+                            SmallIconKey(Icons.Rounded.VolumeUp, "رفع الصوت") {
+                                volume = (volume + 2f).coerceAtMost(100f)
+                                command { it.button("VOLUMEUP") }
+                            }
+                        }
+
+                        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                MediaKey(Icons.Rounded.FastRewind, Modifier.weight(1f)) { command { it.button("REWIND") } }
+                                MediaKey(Icons.Rounded.PlayArrow, Modifier.weight(1f)) { command { it.button("PLAY") } }
+                                MediaKey(Icons.Rounded.Pause, Modifier.weight(1f)) { command { it.button("PAUSE") } }
+                                MediaKey(Icons.Rounded.Stop, Modifier.weight(1f)) { command { it.button("STOP") } }
+                                MediaKey(Icons.Rounded.FastForward, Modifier.weight(1f)) { command { it.button("FASTFORWARD") } }
+                            }
+                        }
                     }
                 }
+            }
 
-                // Volume & Media Control Card
+            RemoteTab.KODI -> {
+                // Direct Kodi Movies Library Tab
                 Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(SurfaceCard)
-                        .border(1.dp, BorderSubtle, RoundedCornerShape(18.dp))
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Row(
@@ -867,137 +1127,317 @@ private fun RemoteScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        SmallIconKey(Icons.Rounded.VolumeOff, "كتم") { command { it.button("MUTE") } }
-                        SmallIconKey(Icons.Rounded.VolumeDown, "خفض الصوت") {
-                            volume = (volume - 2f).coerceAtLeast(0f)
-                            command { it.button("VOLUMEDOWN") }
-                        }
-                        Slider(
-                            value = volume,
-                            onValueChange = { volume = it },
-                            onValueChangeFinished = { command(false) { it.setVolume(volume.toInt()) } },
-                            valueRange = 0f..100f,
+                        OutlinedTextField(
+                            value = kodiFilter,
+                            onValueChange = { kodiFilter = it },
                             modifier = Modifier.weight(1f),
-                            colors = SliderDefaults.colors(
-                                thumbColor = Accent,
-                                activeTrackColor = Accent,
-                                inactiveTrackColor = BorderSubtle
+                            singleLine = true,
+                            placeholder = { Text("ابحث في أفلامك داخل كودي…", fontSize = 12.sp, color = TextMuted) },
+                            textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = TextPrimary),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = KodiBlue,
+                                unfocusedBorderColor = BorderSubtle,
+                                focusedContainerColor = SurfaceCard,
+                                unfocusedContainerColor = SurfaceCard
+                            ),
+                            leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null, tint = KodiBlue, modifier = Modifier.size(18.dp)) }
+                        )
+                        FilledTonalIconButton(
+                            onClick = { refreshKodiMovies(autoLaunch = true) },
+                            enabled = !kodiLoading,
+                            modifier = Modifier.size(46.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = SurfaceCard, contentColor = KodiBlue)
+                        ) {
+                            Icon(Icons.Rounded.Refresh, contentDescription = "تحديث الأفلام", modifier = Modifier.size(20.dp))
+                        }
+                        FilledTonalIconButton(
+                            onClick = { showKodiSettings = !showKodiSettings },
+                            modifier = Modifier.size(46.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                containerColor = if (showKodiSettings) SurfaceElevated else SurfaceCard,
+                                contentColor = TextPrimary
                             )
-                        )
-                        Text(
-                            text = "${volume.toInt()}%",
-                            color = TextPrimary,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.width(34.dp),
-                            textAlign = TextAlign.Center
-                        )
-                        SmallIconKey(Icons.Rounded.VolumeUp, "رفع الصوت") {
-                            volume = (volume + 2f).coerceAtMost(100f)
-                            command { it.button("VOLUMEUP") }
+                        ) {
+                            Icon(Icons.Rounded.Tune, contentDescription = "إعدادات كودي", modifier = Modifier.size(20.dp))
                         }
                     }
 
-                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    AnimatedVisibility(visible = showKodiSettings) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(SurfaceCard)
+                                .border(1.dp, BorderSubtle, RoundedCornerShape(14.dp))
+                                .padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "لتفعيل القائمة من كودي مرة واحدة: الإعدادات ← الخدمات ← التحكم ← السماح بالتحكم عن بُعد عبر HTTP (المنفذ الافتراضي 8080).",
+                                fontSize = 11.sp,
+                                color = TextMuted
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                OutlinedTextField(
+                                    value = kodiPortText,
+                                    onValueChange = { kodiPortText = it.filter(Char::isDigit).take(5) },
+                                    modifier = Modifier.weight(0.8f),
+                                    singleLine = true,
+                                    label = { Text("المنفذ", fontSize = 10.sp) },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = TextPrimary),
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                OutlinedTextField(
+                                    value = kodiUser,
+                                    onValueChange = { kodiUser = it },
+                                    modifier = Modifier.weight(1f),
+                                    singleLine = true,
+                                    label = { Text("المستخدم", fontSize = 10.sp) },
+                                    textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = TextPrimary),
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                OutlinedTextField(
+                                    value = kodiPass,
+                                    onValueChange = { kodiPass = it },
+                                    modifier = Modifier.weight(1f),
+                                    singleLine = true,
+                                    label = { Text("كلمة المرور", fontSize = 10.sp) },
+                                    visualTransformation = PasswordVisualTransformation(),
+                                    textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = TextPrimary),
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                            }
+                            Button(
+                                onClick = {
+                                    val port = kodiPortText.toIntOrNull()?.coerceIn(1, 65535) ?: 8080
+                                    onSaveKodi(port, kodiUser.trim(), kodiPass)
+                                    showKodiSettings = false
+                                    refreshKodiMovies(autoLaunch = true)
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(10.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = KodiBlue, contentColor = Ink)
+                            ) {
+                                Text("حفظ وجلب أفلام كودي", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
+                    }
+
+                    kodiStatus?.let { msg ->
                         Row(
                             modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            MediaKey(Icons.Rounded.FastRewind, Modifier.weight(1f)) { command { it.button("REWIND") } }
-                            MediaKey(Icons.Rounded.PlayArrow, Modifier.weight(1f)) { command { it.button("PLAY") } }
-                            MediaKey(Icons.Rounded.Pause, Modifier.weight(1f)) { command { it.button("PAUSE") } }
-                            MediaKey(Icons.Rounded.Stop, Modifier.weight(1f)) { command { it.button("STOP") } }
-                            MediaKey(Icons.Rounded.FastForward, Modifier.weight(1f)) { command { it.button("FASTFORWARD") } }
+                            if (kodiLoading) {
+                                CircularProgressIndicator(color = KodiBlue, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
+                            }
+                            Text(msg, color = KodiBlue, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+
+                    val filteredMovies = remember(kodiMovies, kodiFilter) {
+                        val q = kodiFilter.trim()
+                        if (q.isEmpty()) kodiMovies
+                        else kodiMovies.filter { it.title.contains(q, true) || it.year.toString().contains(q) }
+                    }
+
+                    if (filteredMovies.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clip(RoundedCornerShape(18.dp))
+                                .background(SurfaceCard)
+                                .padding(16.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                Icon(Icons.Rounded.LocalMovies, contentDescription = null, tint = KodiBlue.copy(alpha = 0.7f), modifier = Modifier.size(40.dp))
+                                Text(
+                                    text = if (kodiMovies.isEmpty()) "اضغط الزر بالأسفل لتشغيل كودي وجلب قائمة أفلامك وحفظها هنا" else "لا توجد أفلام مطابقة للبحث",
+                                    color = TextMuted,
+                                    fontSize = 13.sp,
+                                    textAlign = TextAlign.Center
+                                )
+                                if (kodiMovies.isEmpty()) {
+                                    Button(
+                                        onClick = { refreshKodiMovies(autoLaunch = true) },
+                                        enabled = !kodiLoading,
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = KodiBlue, contentColor = Ink)
+                                    ) {
+                                        Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("جلب قائمة أفلام كودي", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(3),
+                            modifier = Modifier.fillMaxSize(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(filteredMovies, key = { it.movieId }) { movie ->
+                                Column(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(SurfaceCard)
+                                        .border(1.dp, BorderSubtle, RoundedCornerShape(14.dp))
+                                        .clickable { playKodiMovieDirectly(movie) }
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .aspectRatio(0.68f)
+                                            .background(SurfaceElevated),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(Icons.Rounded.Movie, contentDescription = null, tint = KodiBlue.copy(alpha = 0.5f), modifier = Modifier.size(34.dp))
+                                        if (!movie.posterUrl.isNullOrBlank()) {
+                                            AsyncImage(
+                                                model = movie.posterUrl,
+                                                imageLoader = kodiImageLoader,
+                                                contentDescription = movie.title,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        }
+                                        if (movie.year > 0) {
+                                            Text(
+                                                text = movie.year.toString(),
+                                                color = Color.White,
+                                                fontSize = 9.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier
+                                                    .align(Alignment.TopEnd)
+                                                    .padding(4.dp)
+                                                    .clip(RoundedCornerShape(5.dp))
+                                                    .background(Color.Black.copy(alpha = 0.75f))
+                                                    .padding(horizontal = 5.dp, vertical = 1.dp)
+                                            )
+                                        }
+                                        Box(
+                                            modifier = Modifier
+                                                .align(Alignment.BottomStart)
+                                                .padding(5.dp)
+                                                .size(26.dp)
+                                                .clip(CircleShape)
+                                                .background(KodiBlue.copy(alpha = 0.92f)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(Icons.Rounded.PlayArrow, contentDescription = "تشغيل", tint = Ink, modifier = Modifier.size(18.dp))
+                                        }
+                                    }
+                                    Text(
+                                        text = movie.title,
+                                        color = TextPrimary,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp)
+                                    )
+                                }
+                            }
                         }
                     }
                 }
             }
-        } else {
-            // Apps Grid Tab with TLS-trusted TV ImageLoader + Smart Colored Icon Fallback
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+
+            RemoteTab.APPS -> {
+                // Apps Grid Tab
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("تطبيقات التلفزيون", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = TextPrimary)
-                    FilledTonalButton(
-                        onClick = { command(false) { apps = it.getApps() } },
-                        shape = RoundedCornerShape(10.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("تحديث", fontSize = 12.sp)
+                        Text("تطبيقات التلفزيون", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = TextPrimary)
+                        FilledTonalButton(
+                            onClick = { command(false) { apps = it.getApps() } },
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("تحديث", fontSize = 12.sp)
+                        }
                     }
-                }
-                if (apps.isEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .clip(RoundedCornerShape(18.dp))
-                            .background(SurfaceCard),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            if (connected) "اضغط تحديث لعرض تطبيقات التلفزيون" else "اتصل بالتلفزيون لعرض التطبيقات",
-                            color = TextMuted,
-                            fontSize = 13.sp
-                        )
-                    }
-                } else {
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(3),
-                        modifier = Modifier.fillMaxSize(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        items(apps, key = { it.id }) { app ->
-                            val badgeColor = parseHexColor(app.iconColor, SurfaceElevated)
-                            Column(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .background(SurfaceCard)
-                                    .border(1.dp, BorderSubtle, RoundedCornerShape(16.dp))
-                                    .clickable { command { it.launchApp(app.id) } }
-                                    .padding(10.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Box(
+                    if (apps.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clip(RoundedCornerShape(18.dp))
+                                .background(SurfaceCard),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                if (connected) "اضغط تحديث لعرض تطبيقات التلفزيون" else "اتصل بالتلفزيون لعرض التطبيقات",
+                                color = TextMuted,
+                                fontSize = 13.sp
+                            )
+                        }
+                    } else {
+                        LazyVerticalGrid(
+                            columns = GridCells.Fixed(3),
+                            modifier = Modifier.fillMaxSize(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            items(apps, key = { it.id }) { app ->
+                                val badgeColor = parseHexColor(app.iconColor, SurfaceElevated)
+                                Column(
                                     modifier = Modifier
-                                        .size(50.dp)
-                                        .clip(RoundedCornerShape(14.dp))
-                                        .background(badgeColor),
-                                    contentAlignment = Alignment.Center
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .background(SurfaceCard)
+                                        .border(1.dp, BorderSubtle, RoundedCornerShape(16.dp))
+                                        .clickable { command { it.launchApp(app.id) } }
+                                        .padding(10.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    Icon(
-                                        imageVector = fallbackIconForApp(app),
-                                        contentDescription = app.title,
-                                        tint = Color.White,
-                                        modifier = Modifier.size(26.dp)
-                                    )
-                                    if (!app.icon.isNullOrBlank()) {
-                                        AsyncImage(
-                                            model = app.icon,
-                                            imageLoader = tvImageLoader,
+                                    Box(
+                                        modifier = Modifier
+                                            .size(50.dp)
+                                            .clip(RoundedCornerShape(14.dp))
+                                            .background(badgeColor),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = fallbackIconForApp(app),
                                             contentDescription = app.title,
-                                            contentScale = ContentScale.Crop,
-                                            modifier = Modifier.fillMaxSize()
+                                            tint = Color.White,
+                                            modifier = Modifier.size(26.dp)
                                         )
+                                        if (!app.icon.isNullOrBlank()) {
+                                            AsyncImage(
+                                                model = app.icon,
+                                                imageLoader = tvImageLoader,
+                                                contentDescription = app.title,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        }
                                     }
+                                    Text(
+                                        text = app.title,
+                                        fontSize = 11.sp,
+                                        color = TextPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        textAlign = TextAlign.Center
+                                    )
                                 }
-                                Text(
-                                    text = app.title,
-                                    fontSize = 11.sp,
-                                    color = TextPrimary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    textAlign = TextAlign.Center
-                                )
                             }
                         }
                     }
@@ -1088,7 +1528,7 @@ private fun RemoteScreen(
         }
     }
 
-    // In-App YouTube Search Results Dialog -> Tap any result to play immediately on Cobalt TV!
+    // In-App YouTube Search Results Dialog
     if (showYtDialog) {
         Dialog(
             onDismissRequest = { showYtDialog = false },
@@ -1234,6 +1674,7 @@ private fun TabPill(
     label: String,
     icon: ImageVector,
     selected: Boolean,
+    accentColor: Color,
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
@@ -1242,17 +1683,19 @@ private fun TabPill(
             .clip(RoundedCornerShape(10.dp))
             .background(if (selected) SurfaceElevated else Color.Transparent)
             .clickable(onClick = onClick)
-            .padding(vertical = 8.dp, horizontal = 10.dp),
+            .padding(vertical = 8.dp, horizontal = 6.dp),
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Icon(icon, contentDescription = null, tint = if (selected) Accent else TextMuted, modifier = Modifier.size(16.dp))
-        Spacer(Modifier.width(6.dp))
+        Icon(icon, contentDescription = null, tint = if (selected) accentColor else TextMuted, modifier = Modifier.size(15.dp))
+        Spacer(Modifier.width(4.dp))
         Text(
             text = label,
             color = if (selected) TextPrimary else TextMuted,
-            fontSize = 12.sp,
-            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+            fontSize = 11.sp,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }

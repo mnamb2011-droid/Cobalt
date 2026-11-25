@@ -5,6 +5,7 @@ files:
   AndroidManifest.xml: app/src/main/AndroidManifest.xml
   MainActivity.kt: app/src/main/java/com/mnasser/cobaltremote/MainActivity.kt
   WebOsClient.kt: app/src/main/java/com/mnasser/cobaltremote/WebOsClient.kt
+  KodiClient.kt: app/src/main/java/com/mnasser/cobaltremote/KodiClient.kt
   strings.xml: app/src/main/res/values/strings.xml
   app-icon.png: app/src/main/res/mipmap-nodpi/ic_launcher.png
 workflow:
