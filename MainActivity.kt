@@ -70,6 +70,7 @@ private val SurfaceElevated = Color(0xFF1C2A42)
 private val BorderSubtle = Color(0xFF283A57)
 private val Accent = Color(0xFF2EE6CE)
 private val AccentDark = Color(0xFF062925)
+private val YoutubeRed = Color(0xFFFF3D57)
 private val Danger = Color(0xFFFF5C72)
 private val Warning = Color(0xFFFFC861)
 private val TextPrimary = Color(0xFFF3F6FB)
@@ -165,12 +166,10 @@ private class SecureStore(context: Context) {
     }
 }
 
-/** Multi-strategy LG webOS TV discovery: SSDP (UPnP) + NSD (mDNS) + fast local /24 port 3001 scan. */
 private suspend fun discoverLgTv(context: Context): String? = withContext(Dispatchers.IO) {
     val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
     val lock = runCatching { wifi?.createMulticastLock("cobalt_ssdp")?.apply { setReferenceCounted(false); acquire() } }.getOrNull()
     try {
-        // 1. Run SSDP and NSD concurrently first (fast, 3.5s)
         val fastResult = CompletableDeferred<String?>()
         coroutineScope {
             val ssdpJob = launch {
@@ -183,7 +182,6 @@ private suspend fun discoverLgTv(context: Context): String? = withContext(Dispat
             ssdpJob.cancel()
             nsdJob.cancel()
             if (found != null) return@coroutineScope found
-            // 2. Fallback: parallel TCP probe on port 3001 across the local /24 subnet
             scanLocalSubnetForWebOs(context)
         }
     } finally {
@@ -310,6 +308,7 @@ private fun RemoteScreen(
     var status by remember { mutableStateOf("جارٍ تهيئة الاتصال…") }
     var busy by remember { mutableStateOf(false) }
     var connected by remember { mutableStateOf(false) }
+    var imeFocused by remember { mutableStateOf(false) }
     var pairingKey by remember { mutableStateOf(savedKey) }
     var certificatePin by remember { mutableStateOf(savedFingerprint) }
     var client by remember { mutableStateOf<WebOsClient?>(null) }
@@ -319,7 +318,6 @@ private fun RemoteScreen(
     var showConnectionPanel by remember { mutableStateOf(savedIp.isBlank()) }
     var connectJob by remember { mutableStateOf<Job?>(null) }
 
-    // Ordered queue for live keyboard typing so rapid keystrokes never arrive out of order.
     val imeQueue = remember { Channel<suspend (WebOsClient) -> Unit>(Channel.UNLIMITED) }
 
     LaunchedEffect(Unit) {
@@ -329,11 +327,24 @@ private fun RemoteScreen(
                 if (err is WebOsConnectionException) {
                     connected = false
                     status = err.message ?: "انقطع الاتصال"
-                } else {
-                    status = "افتح مربع كتابة على التلفزيون أولاً"
                 }
             }
         }
+    }
+
+    fun resolveYouTubeAppId(foregroundId: String?): String {
+        if (!foregroundId.isNullOrBlank() &&
+            (foregroundId.contains("youtube", true) || foregroundId.contains("cobalt", true))
+        ) {
+            return foregroundId
+        }
+        apps.firstOrNull {
+            it.id.contains("cobalt", true) || it.title.contains("cobalt", true)
+        }?.let { return it.id }
+        apps.firstOrNull {
+            it.id.contains("youtube", true) || it.title.contains("youtube", true)
+        }?.let { return it.id }
+        return "youtube.leanback.v4"
     }
 
     fun connect(address: String, fallbackToDiscovery: Boolean = false) {
@@ -351,9 +362,13 @@ private fun RemoteScreen(
                     host = cleanIp,
                     clientKey = pairingKey,
                     pinnedFingerprint = certificatePin,
+                    onImeFocusChanged = { focused ->
+                        scope.launch(Dispatchers.Main) { imeFocused = focused }
+                    },
                     onDisconnected = { reason ->
                         scope.launch(Dispatchers.Main) {
                             connected = false
+                            imeFocused = false
                             status = reason
                         }
                     }
@@ -368,7 +383,7 @@ private fun RemoteScreen(
                     pairingKey = result.getOrThrow()
                     certificatePin = candidate.certificateFingerprint() ?: certificatePin
                     onSave(cleanIp, pairingKey!!, certificatePin)
-                    status = "متصل • الكتابة المباشرة مفعّلة"
+                    status = "متصل • $cleanIp"
                     runCatching { candidate.getVolume()?.let { volume = it.toFloat() } }
                     runCatching { apps = candidate.getApps() }
                 } else {
@@ -396,7 +411,6 @@ private fun RemoteScreen(
         }
     }
 
-    // Auto-connect on launch: use saved IP first (with discovery fallback), or discover automatically.
     LaunchedEffect(Unit) {
         if (savedIp.isNotBlank()) {
             connect(savedIp, fallbackToDiscovery = true)
@@ -414,7 +428,6 @@ private fun RemoteScreen(
         }
     }
 
-    // Auto-reconnect when returning to the app if disconnected.
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME && !connected && !busy && ip.isNotBlank()) {
@@ -448,31 +461,47 @@ private fun RemoteScreen(
         }
     }
 
-    // Live phone-to-TV keyboard diffing: sends every typed char and backspace immediately.
+    // Live sync for native webOS text fields (Browser/Store/Settings)
     fun onLiveTextChange(newText: String) {
         val oldText = lastSentText
         typed = newText
         lastSentText = newText
-        if (!connected || client == null) return
+        if (!connected || client == null || !imeFocused) return
 
         when {
             newText == oldText -> Unit
             newText.startsWith(oldText) -> {
                 val added = newText.substring(oldText.length)
-                if (added.isNotEmpty()) {
-                    imeQueue.trySend { it.insertText(added, replace = false) }
-                }
+                if (added.isNotEmpty()) imeQueue.trySend { it.insertText(added, replace = false) }
             }
             oldText.startsWith(newText) -> {
                 val deletedCount = oldText.length - newText.length
-                if (deletedCount > 0) {
-                    imeQueue.trySend { it.deleteCharacters(deletedCount) }
-                }
+                if (deletedCount > 0) imeQueue.trySend { it.deleteCharacters(deletedCount) }
             }
-            else -> {
-                imeQueue.trySend { it.insertText(newText, replace = true) }
+            else -> imeQueue.trySend { it.insertText(newText, replace = true) }
+        }
+    }
+
+    // Smart Submit: if native webOS IME is focused -> send Enter; otherwise -> open search directly in Cobalt YouTube!
+    fun submitTextOrYouTubeSearch(forceYouTube: Boolean = false) {
+        val query = typed.trim()
+        command { c ->
+            if (!forceYouTube && c.imeFocused) {
+                if (query.isNotEmpty() && lastSentText != query) {
+                    c.insertText(query, replace = true)
+                }
+                c.sendEnter()
+            } else if (query.isNotEmpty()) {
+                val fg = c.getForegroundAppId()
+                val ytId = resolveYouTubeAppId(fg)
+                c.launchYouTubeSearch(ytId, query)
+                status = "تم إرسال البحث إلى يوتيوب: $query"
+            } else {
+                c.sendEnter()
             }
         }
+        typed = ""
+        lastSentText = ""
     }
 
     Column(
@@ -516,7 +545,7 @@ private fun RemoteScreen(
                     )
                 }
                 Text(
-                    text = if (connected) "متصل • $ip" else status,
+                    text = if (connected) status else status,
                     color = if (connected) Accent else TextMuted,
                     fontSize = 11.sp,
                     maxLines = 1,
@@ -555,7 +584,7 @@ private fun RemoteScreen(
             }
         }
 
-        // 2. Collapsible Connection Panel (auto-hidden when connected so remote gets full screen)
+        // 2. Collapsible Connection Panel
         AnimatedVisibility(visible = showConnectionPanel) {
             Column(
                 modifier = Modifier
@@ -621,6 +650,7 @@ private fun RemoteScreen(
                             client?.disconnect()
                             client = null
                             connected = false
+                            imeFocused = false
                             onClear()
                             pairingKey = null
                             certificatePin = null
@@ -634,7 +664,7 @@ private fun RemoteScreen(
             }
         }
 
-        // 3. Clean Mode Switcher (Remote vs Apps)
+        // 3. Mode Switcher (Remote vs Apps)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -660,18 +690,62 @@ private fun RemoteScreen(
             }
         }
 
-        // 4. Main Content Area (fills all available vertical space cleanly!)
+        // 4. Main Content Area
         if (activeTab == RemoteTab.REMOTE) {
             Column(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // Interactive Touchpad (expands gracefully to fill available height)
+                // D-Pad ON TOP (flanked by Back / Exit / Home / Menu)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        SideNavButton(Icons.AutoMirrored.Rounded.ArrowBack, "رجوع") { command { it.button("BACK") } }
+                        SideNavButton(Icons.Rounded.Close, "خروج") { command { it.button("EXIT") } }
+                    }
+
+                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                        Box(
+                            modifier = Modifier
+                                .size(196.dp)
+                                .clip(CircleShape)
+                                .background(SurfaceCard)
+                                .border(1.5.dp, BorderSubtle, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            DpadArrow(Icons.Rounded.KeyboardArrowUp, Modifier.align(Alignment.TopCenter).padding(top = 6.dp)) { command { it.button("UP") } }
+                            DpadArrow(Icons.Rounded.KeyboardArrowDown, Modifier.align(Alignment.BottomCenter).padding(bottom = 6.dp)) { command { it.button("DOWN") } }
+                            DpadArrow(Icons.Rounded.KeyboardArrowLeft, Modifier.align(Alignment.CenterStart).padding(start = 6.dp)) { command { it.button("LEFT") } }
+                            DpadArrow(Icons.Rounded.KeyboardArrowRight, Modifier.align(Alignment.CenterEnd).padding(end = 6.dp)) { command { it.button("RIGHT") } }
+
+                            Box(
+                                modifier = Modifier
+                                    .size(72.dp)
+                                    .clip(CircleShape)
+                                    .background(Brush.linearGradient(listOf(Accent, Color(0xFF14B8A6))))
+                                    .clickable { command { it.button("ENTER") } },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("OK", color = AccentDark, fontWeight = FontWeight.Black, fontSize = 17.sp)
+                            }
+                        }
+                    }
+
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        SideNavButton(Icons.Rounded.Home, "الرئيسية") { command { it.button("HOME") } }
+                        SideNavButton(Icons.Rounded.Menu, "القائمة") { command { it.button("MENU") } }
+                    }
+                }
+
+                // Touchpad BELOW the D-Pad arrows!
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
-                        .heightIn(min = 115.dp)
+                        .heightIn(min = 110.dp)
                         .clip(RoundedCornerShape(22.dp))
                         .background(Brush.verticalGradient(listOf(SurfaceElevated, SurfaceCard)))
                         .border(1.dp, BorderSubtle, RoundedCornerShape(22.dp))
@@ -702,53 +776,6 @@ private fun RemoteScreen(
                     }
                 }
 
-                // Ergonomic Circular D-Pad flanked by Back / Home / Exit / Menu
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    // Right-side quick buttons (in RTL)
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        SideNavButton(Icons.AutoMirrored.Rounded.ArrowBack, "رجوع") { command { it.button("BACK") } }
-                        SideNavButton(Icons.Rounded.Close, "خروج") { command { it.button("EXIT") } }
-                    }
-
-                    // Physical LTR Circular D-Pad so Left is always Left and Right is always Right
-                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-                        Box(
-                            modifier = Modifier
-                                .size(196.dp)
-                                .clip(CircleShape)
-                                .background(SurfaceCard)
-                                .border(1.5.dp, BorderSubtle, CircleShape),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            DpadArrow(Icons.Rounded.KeyboardArrowUp, Modifier.align(Alignment.TopCenter).padding(top = 6.dp)) { command { it.button("UP") } }
-                            DpadArrow(Icons.Rounded.KeyboardArrowDown, Modifier.align(Alignment.BottomCenter).padding(bottom = 6.dp)) { command { it.button("DOWN") } }
-                            DpadArrow(Icons.Rounded.KeyboardArrowLeft, Modifier.align(Alignment.CenterStart).padding(start = 6.dp)) { command { it.button("LEFT") } }
-                            DpadArrow(Icons.Rounded.KeyboardArrowRight, Modifier.align(Alignment.CenterEnd).padding(end = 6.dp)) { command { it.button("RIGHT") } }
-
-                            Box(
-                                modifier = Modifier
-                                    .size(72.dp)
-                                    .clip(CircleShape)
-                                    .background(Brush.linearGradient(listOf(Accent, Color(0xFF14B8A6))))
-                                    .clickable { command { it.button("ENTER") } },
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text("OK", color = AccentDark, fontWeight = FontWeight.Black, fontSize = 17.sp)
-                            }
-                        }
-                    }
-
-                    // Left-side quick buttons (in RTL)
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        SideNavButton(Icons.Rounded.Home, "الرئيسية") { command { it.button("HOME") } }
-                        SideNavButton(Icons.Rounded.Menu, "القائمة") { command { it.button("MENU") } }
-                    }
-                }
-
                 // Volume & Media Control Card
                 Column(
                     modifier = Modifier
@@ -759,7 +786,6 @@ private fun RemoteScreen(
                         .padding(horizontal = 12.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Volume Bar with live apply on drag finish
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
@@ -796,7 +822,6 @@ private fun RemoteScreen(
                         }
                     }
 
-                    // Media Transport Row (physical LTR order: Rewind -> Play -> Pause -> Stop -> FastForward)
                     CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -901,7 +926,7 @@ private fun RemoteScreen(
             }
         }
 
-        // 5. Persistent Live Keyboard Dock (sends every keystroke & backspace directly to TV!)
+        // 5. Smart Keyboard & Direct Cobalt YouTube Search Dock
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -917,30 +942,30 @@ private fun RemoteScreen(
                 onValueChange = { onLiveTextChange(it) },
                 modifier = Modifier.weight(1f),
                 singleLine = true,
-                placeholder = { Text("اكتب هنا للإرسال المباشر للتلفزيون…", fontSize = 12.sp, color = TextMuted) },
+                placeholder = {
+                    Text(
+                        if (imeFocused) "كتابة مباشرة في التلفزيون…" else "ابحث في كوبالت يوتيوب أو الصق رابطاً…",
+                        fontSize = 12.sp,
+                        color = TextMuted
+                    )
+                },
                 textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = TextPrimary),
                 shape = RoundedCornerShape(12.dp),
                 colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = Accent,
+                    focusedBorderColor = if (imeFocused) Accent else YoutubeRed,
                     unfocusedBorderColor = Color.Transparent,
                     focusedContainerColor = Ink,
                     unfocusedContainerColor = Ink
                 ),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                keyboardActions = KeyboardActions(
-                    onSearch = {
-                        command { it.sendEnter() }
-                        typed = ""
-                        lastSentText = ""
-                    }
-                ),
+                keyboardActions = KeyboardActions(onSearch = { submitTextOrYouTubeSearch(forceYouTube = false) }),
                 trailingIcon = {
                     if (typed.isNotEmpty()) {
                         IconButton(onClick = {
                             val len = typed.length
                             typed = ""
                             lastSentText = ""
-                            imeQueue.trySend { it.deleteCharacters(len) }
+                            if (imeFocused) imeQueue.trySend { it.deleteCharacters(len) }
                         }) {
                             Icon(Icons.Rounded.DeleteOutline, contentDescription = "مسح", tint = TextMuted, modifier = Modifier.size(18.dp))
                         }
@@ -948,35 +973,40 @@ private fun RemoteScreen(
                 }
             )
 
-            // Direct TV Backspace button (works even when local field is empty)
-            FilledTonalIconButton(
-                onClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    if (typed.isNotEmpty()) {
-                        typed = typed.dropLast(1)
-                        lastSentText = typed
-                    }
-                    imeQueue.trySend { it.deleteCharacters(1) }
-                },
-                modifier = Modifier.size(44.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = SurfaceElevated, contentColor = TextPrimary)
-            ) {
-                Icon(Icons.AutoMirrored.Rounded.Backspace, contentDescription = "حذف حرف", modifier = Modifier.size(19.dp))
+            // Direct Backspace (for native webOS IME)
+            if (imeFocused) {
+                FilledTonalIconButton(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        if (typed.isNotEmpty()) {
+                            typed = typed.dropLast(1)
+                            lastSentText = typed
+                        }
+                        imeQueue.trySend { it.deleteCharacters(1) }
+                    },
+                    modifier = Modifier.size(44.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = SurfaceElevated, contentColor = TextPrimary)
+                ) {
+                    Icon(Icons.AutoMirrored.Rounded.Backspace, contentDescription = "حذف حرف", modifier = Modifier.size(19.dp))
+                }
             }
 
-            // Direct TV Enter / Search button
+            // Direct Cobalt YouTube Search / Video Launch button
             FilledIconButton(
-                onClick = {
-                    command { it.sendEnter() }
-                    typed = ""
-                    lastSentText = ""
-                },
+                onClick = { submitTextOrYouTubeSearch(forceYouTube = !imeFocused) },
                 modifier = Modifier.size(44.dp),
                 shape = RoundedCornerShape(12.dp),
-                colors = IconButtonDefaults.filledIconButtonColors(containerColor = Accent, contentColor = AccentDark)
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = if (imeFocused) Accent else YoutubeRed,
+                    contentColor = if (imeFocused) AccentDark else Color.White
+                )
             ) {
-                Icon(Icons.AutoMirrored.Rounded.KeyboardReturn, contentDescription = "إدخال وبحث", modifier = Modifier.size(20.dp))
+                Icon(
+                    imageVector = if (imeFocused) Icons.AutoMirrored.Rounded.KeyboardReturn else Icons.Rounded.Search,
+                    contentDescription = if (imeFocused) "إرسال" else "بحث في يوتيوب",
+                    modifier = Modifier.size(21.dp)
+                )
             }
         }
     }

@@ -6,6 +6,7 @@ import okhttp3.*
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.URLEncoder
 import java.security.MessageDigest
 import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
@@ -19,11 +20,12 @@ data class TvApp(val title: String, val id: String, val icon: String?)
 class WebOsConnectionException(message: String, cause: Throwable? = null) : IOException(message, cause)
 class WebOsCommandException(message: String) : IllegalStateException(message)
 
-/** LG webOS SSAP client with TOFU TLS certificate pinning, pointer socket, and live IME keyboard support. */
+/** LG webOS SSAP client with TOFU TLS pinning, pointer socket, native IME, and Cobalt YouTube direct search. */
 class WebOsClient(
     private val host: String,
     private var clientKey: String?,
     private val pinnedFingerprint: String? = null,
+    private val onImeFocusChanged: ((Boolean) -> Unit)? = null,
     private val onDisconnected: ((String) -> Unit)? = null
 ) {
     private val ids = AtomicInteger(1)
@@ -33,6 +35,9 @@ class WebOsClient(
     private val errors = CompletableDeferred<String>()
     private val connectedFlag = AtomicBoolean(false)
     private val disconnectedNotified = AtomicBoolean(false)
+
+    @Volatile var imeFocused: Boolean = false
+        private set
 
     private var mainSocket: WebSocket? = null
     private var inputSocket: WebSocket? = null
@@ -60,7 +65,6 @@ class WebOsClient(
         val ssl = SSLContext.getInstance("TLS").apply { init(null, arrayOf<TrustManager>(trust), null) }
         return OkHttpClient.Builder()
             .sslSocketFactory(ssl.socketFactory, trust)
-            // LG webOS TVs use self-signed certificates without IP SANs; pinned above via SHA-256 TOFU.
             .hostnameVerifier(HostnameVerifier { _, _ -> pinnedFingerprint != null || observedFingerprint != null })
             .connectTimeout(6, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
@@ -70,6 +74,7 @@ class WebOsClient(
 
     private fun notifyDisconnect(reason: String) {
         connectedFlag.set(false)
+        imeFocused = false
         pending.values.forEach { if (!it.isCompleted) it.completeExceptionally(WebOsConnectionException(reason)) }
         pending.clear()
         if (disconnectedNotified.compareAndSet(false, true)) {
@@ -90,9 +95,20 @@ class WebOsClient(
                     val msg = JSONObject(text)
                     val type = msg.optString("type")
                     val id = msg.opt("id")?.toString()
+                    val payload = msg.optJSONObject("payload")
+
+                    // Track native webOS IME focus updates pushed by registerRemoteKeyboard
+                    payload?.optJSONObject("currentWidget")?.let { widget ->
+                        val focused = widget.optBoolean("focus", false)
+                        if (imeFocused != focused) {
+                            imeFocused = focused
+                            onImeFocusChanged?.invoke(focused)
+                        }
+                    }
+
                     if (type == "hello" && !helloMessage.isCompleted) helloMessage.complete(msg)
                     if (type == "registered") {
-                        msg.optJSONObject("payload")?.optString("client-key")
+                        payload?.optString("client-key")
                             ?.takeIf { it.isNotBlank() }
                             ?.let { if (!registered.isCompleted) registered.complete(it) }
                     }
@@ -149,7 +165,7 @@ class WebOsClient(
             )
         )
         val manifest = JSONObject()
-            .put("appVersion", "1.2")
+            .put("appVersion", "1.3")
             .put("manifestVersion", 1)
             .put("permissions", permissions)
         val payload = JSONObject()
@@ -191,7 +207,6 @@ class WebOsClient(
         inputSocket = inWs
         withTimeout(8000) { inputReady.await() }
 
-        // Subscribe to webOS remote keyboard service (correct SSAP URI).
         runCatching { subscribe("com.webos.service.ime/registerRemoteKeyboard") }
         connectedFlag.set(true)
         return clientKey!!
@@ -256,12 +271,19 @@ class WebOsClient(
         inputSocket?.send("type:scroll\ndy:$dy\n\n")
     }
 
-    /** LG webOS IME insertText requires integer replace flag: 0 = append, 1 = replace. */
+    /** Dual-compatible insertText: tries integer replace (0/1) then boolean replace (false/true). */
     suspend fun insertText(text: String, replace: Boolean = false) {
-        request(
-            "com.webos.service.ime/insertText",
-            JSONObject().put("text", text).put("replace", if (replace) 1 else 0)
-        )
+        try {
+            request(
+                "com.webos.service.ime/insertText",
+                JSONObject().put("text", text).put("replace", if (replace) 1 else 0)
+            )
+        } catch (_: WebOsCommandException) {
+            request(
+                "com.webos.service.ime/insertText",
+                JSONObject().put("text", text).put("replace", replace)
+            )
+        }
     }
 
     suspend fun deleteCharacters(count: Int = 1) {
@@ -271,6 +293,48 @@ class WebOsClient(
 
     suspend fun sendEnter() {
         request("com.webos.service.ime/sendEnterKey")
+    }
+
+    suspend fun getForegroundAppId(): String? = runCatching {
+        request("com.webos.applicationManager/getForegroundAppInfo")
+            .optJSONObject("payload")
+            ?.optString("appId")
+            ?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+
+    /**
+     * Cobalt YouTube renders its own custom keyboard and ignores webOS system IME.
+     * Launching with contentTarget opens the exact search results (or video URL) directly inside Cobalt!
+     */
+    suspend fun launchYouTubeSearch(appId: String, queryOrUrl: String) {
+        val trimmed = queryOrUrl.trim()
+        if (trimmed.isEmpty()) return
+
+        val videoId = extractYouTubeVideoId(trimmed)
+        val contentTarget = if (videoId != null) {
+            "https://www.youtube.com/watch?v=$videoId"
+        } else {
+            val encoded = URLEncoder.encode(trimmed, "UTF-8")
+            "https://www.youtube.com/tv#/results?search_query=$encoded"
+        }
+
+        val params = JSONObject().put("contentTarget", contentTarget)
+        val payload = JSONObject().put("id", appId).put("params", params)
+        try {
+            request("com.webos.applicationManager/launch", payload)
+        } catch (_: WebOsCommandException) {
+            request("system.launcher/launch", payload)
+        }
+    }
+
+    private fun extractYouTubeVideoId(input: String): String? {
+        val patterns = listOf(
+            Regex("""(?:youtube\.com/watch\?.*?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})""")
+        )
+        for (p in patterns) {
+            p.find(input)?.groupValues?.getOrNull(1)?.let { return it }
+        }
+        return null
     }
 
     suspend fun getVolume(): Int? {
@@ -316,6 +380,7 @@ class WebOsClient(
 
     fun disconnect() {
         connectedFlag.set(false)
+        imeFocused = false
         disconnectedNotified.set(true)
         inputSocket?.close(1000, "disconnect")
         mainSocket?.close(1000, "disconnect")
