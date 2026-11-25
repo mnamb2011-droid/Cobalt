@@ -1,6 +1,8 @@
 package com.mnasser.cobaltremote
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.*
 import org.json.JSONArray
@@ -15,12 +17,25 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.*
 
-data class TvApp(val title: String, val id: String, val icon: String?)
+data class TvApp(
+    val title: String,
+    val id: String,
+    val icon: String?,
+    val iconColor: String? = null
+)
+
+data class YouTubeSearchResult(
+    val videoId: String,
+    val title: String,
+    val channel: String,
+    val duration: String,
+    val thumbnailUrl: String
+)
 
 class WebOsConnectionException(message: String, cause: Throwable? = null) : IOException(message, cause)
 class WebOsCommandException(message: String) : IllegalStateException(message)
 
-/** LG webOS SSAP client with TOFU TLS pinning, pointer socket, native IME, and Cobalt YouTube direct search. */
+/** LG webOS SSAP client with TOFU TLS pinning, TV icon HTTP client, native IME, and Cobalt YouTube launcher. */
 class WebOsClient(
     private val host: String,
     private var clientKey: String?,
@@ -72,6 +87,9 @@ class WebOsClient(
             .build()
     }
 
+    /** OkHttpClient configured to trust this TV's self-signed TLS certificate for loading TV app icons. */
+    fun imageHttpClient(): OkHttpClient = http
+
     private fun notifyDisconnect(reason: String) {
         connectedFlag.set(false)
         imeFocused = false
@@ -97,7 +115,6 @@ class WebOsClient(
                     val id = msg.opt("id")?.toString()
                     val payload = msg.optJSONObject("payload")
 
-                    // Track native webOS IME focus updates pushed by registerRemoteKeyboard
                     payload?.optJSONObject("currentWidget")?.let { widget ->
                         val focused = widget.optBoolean("focus", false)
                         if (imeFocused != focused) {
@@ -165,7 +182,7 @@ class WebOsClient(
             )
         )
         val manifest = JSONObject()
-            .put("appVersion", "1.3")
+            .put("appVersion", "1.4")
             .put("manifestVersion", 1)
             .put("permissions", permissions)
         val payload = JSONObject()
@@ -271,7 +288,6 @@ class WebOsClient(
         inputSocket?.send("type:scroll\ndy:$dy\n\n")
     }
 
-    /** Dual-compatible insertText: tries integer replace (0/1) then boolean replace (false/true). */
     suspend fun insertText(text: String, replace: Boolean = false) {
         try {
             request(
@@ -302,22 +318,9 @@ class WebOsClient(
             ?.takeIf { it.isNotBlank() }
     }.getOrNull()
 
-    /**
-     * Cobalt YouTube renders its own custom keyboard and ignores webOS system IME.
-     * Launching with contentTarget opens the exact search results (or video URL) directly inside Cobalt!
-     */
-    suspend fun launchYouTubeSearch(appId: String, queryOrUrl: String) {
-        val trimmed = queryOrUrl.trim()
-        if (trimmed.isEmpty()) return
-
-        val videoId = extractYouTubeVideoId(trimmed)
-        val contentTarget = if (videoId != null) {
-            "https://www.youtube.com/watch?v=$videoId"
-        } else {
-            val encoded = URLEncoder.encode(trimmed, "UTF-8")
-            "https://www.youtube.com/tv#/results?search_query=$encoded"
-        }
-
+    /** Launches a specific YouTube video directly in Cobalt YouTube via verified contentTarget. */
+    suspend fun playYouTubeVideo(appId: String, videoId: String) {
+        val contentTarget = "https://www.youtube.com/watch?v=$videoId"
         val params = JSONObject().put("contentTarget", contentTarget)
         val payload = JSONObject().put("id", appId).put("params", params)
         try {
@@ -325,16 +328,6 @@ class WebOsClient(
         } catch (_: WebOsCommandException) {
             request("system.launcher/launch", payload)
         }
-    }
-
-    private fun extractYouTubeVideoId(input: String): String? {
-        val patterns = listOf(
-            Regex("""(?:youtube\.com/watch\?.*?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})""")
-        )
-        for (p in patterns) {
-            p.find(input)?.groupValues?.getOrNull(1)?.let { return it }
-        }
-        return null
     }
 
     suspend fun getVolume(): Int? {
@@ -347,17 +340,32 @@ class WebOsClient(
         }?.coerceIn(0, 100)
     }
 
+    private fun resolveIconUrl(raw: String?): String? {
+        val s = raw?.trim().orEmpty()
+        if (s.isEmpty()) return null
+        return when {
+            s.startsWith("http://", true) || s.startsWith("https://", true) -> s
+            s.startsWith("/resources/", true) -> "https://$host:3001$s"
+            else -> null // Local TV filesystem paths (/usr/palm/...) are not HTTP-accessible
+        }
+    }
+
     suspend fun getApps(): List<TvApp> {
         val arr = request("com.webos.applicationManager/listLaunchPoints")
             .optJSONObject("payload")
             ?.optJSONArray("launchPoints") ?: JSONArray()
         return (0 until arr.length()).mapNotNull { i ->
             arr.optJSONObject(i)?.let { a ->
-                a.optString("id").takeIf(String::isNotBlank)?.let {
+                a.optString("id").takeIf(String::isNotBlank)?.let { id ->
+                    val iconUrl = resolveIconUrl(a.optString("largeIcon"))
+                        ?: resolveIconUrl(a.optString("icon"))
+                        ?: resolveIconUrl(a.optString("miniicon"))
+                    val color = a.optString("iconColor").takeIf { it.startsWith("#") }
                     TvApp(
-                        title = a.optString("title", it),
-                        id = it,
-                        icon = a.optString("icon").takeIf(String::isNotBlank)
+                        title = a.optString("title", id),
+                        id = id,
+                        icon = iconUrl,
+                        iconColor = color
                     )
                 }
             }
@@ -391,4 +399,130 @@ class WebOsClient(
 
     fun currentClientKey(): String? = clientKey
     fun certificateFingerprint(): String? = observedFingerprint
+
+    companion object {
+        private val publicHttp = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
+            .build()
+
+        fun extractYouTubeVideoId(input: String): String? {
+            val regex = Regex("""(?:youtube\.com/watch\?.*?v=|youtu\.be/|youtube\.com/shorts/|youtube\.com/live/)([A-Za-z0-9_-]{11})""")
+            return regex.find(input.trim())?.groupValues?.getOrNull(1)
+        }
+
+        /** Searches YouTube directly from the phone and returns clickable video results to cast to Cobalt TV. */
+        suspend fun searchYouTube(query: String): List<YouTubeSearchResult> = withContext(Dispatchers.IO) {
+            val encoded = URLEncoder.encode(query.trim(), "UTF-8")
+            val req = Request.Builder()
+                .url("https://www.youtube.com/results?search_query=$encoded")
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+                .header("Accept-Language", "ar,en;q=0.9")
+                .build()
+
+            val html = publicHttp.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) throw IOException("YouTube HTTP ${resp.code}")
+                resp.body?.string().orEmpty()
+            }
+
+            val jsonStr = extractJsonAfterMarker(html, "var ytInitialData = ")
+                ?: extractJsonAfterMarker(html, "ytInitialData = ")
+                ?: return@withContext emptyList()
+
+            val root = JSONObject(jsonStr)
+            val results = mutableListOf<YouTubeSearchResult>()
+            val seen = HashSet<String>()
+            collectVideoRenderers(root, results, seen, limit = 20)
+            results
+        }
+
+        private fun extractJsonAfterMarker(html: String, marker: String): String? {
+            val idx = html.indexOf(marker)
+            if (idx < 0) return null
+            val start = html.indexOf('{', idx + marker.length)
+            if (start < 0) return null
+            var depth = 0
+            var inString = false
+            var escaped = false
+            for (i in start until html.length) {
+                val ch = html[i]
+                if (inString) {
+                    if (escaped) {
+                        escaped = false
+                    } else if (ch == '\\') {
+                        escaped = true
+                    } else if (ch == '"') {
+                        inString = false
+                    }
+                } else {
+                    when (ch) {
+                        '"' -> inString = true
+                        '{' -> depth++
+                        '}' -> {
+                            depth--
+                            if (depth == 0) return html.substring(start, i + 1)
+                        }
+                    }
+                }
+            }
+            return null
+        }
+
+        private fun collectVideoRenderers(
+            node: Any?,
+            out: MutableList<YouTubeSearchResult>,
+            seen: MutableSet<String>,
+            limit: Int
+        ) {
+            if (out.size >= limit || node == null) return
+            when (node) {
+                is JSONObject -> {
+                    val vr = node.optJSONObject("videoRenderer")
+                    if (vr != null) {
+                        val id = vr.optString("videoId")
+                        if (id.length == 11 && seen.add(id)) {
+                            val title = readText(vr.optJSONObject("title")).ifBlank { "فيديو يوتيوب" }
+                            val channel = readText(vr.optJSONObject("ownerText"))
+                                .ifBlank { readText(vr.optJSONObject("longBylineText")) }
+                            val duration = readText(vr.optJSONObject("lengthText"))
+                            out.add(
+                                YouTubeSearchResult(
+                                    videoId = id,
+                                    title = title,
+                                    channel = channel,
+                                    duration = duration,
+                                    thumbnailUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+                                )
+                            )
+                        }
+                        return
+                    }
+                    val keys = node.keys()
+                    while (keys.hasNext() && out.size < limit) {
+                        collectVideoRenderers(node.opt(keys.next()), out, seen, limit)
+                    }
+                }
+                is JSONArray -> {
+                    for (i in 0 until node.length()) {
+                        if (out.size >= limit) break
+                        collectVideoRenderers(node.opt(i), out, seen, limit)
+                    }
+                }
+            }
+        }
+
+        private fun readText(obj: JSONObject?): String {
+            if (obj == null) return ""
+            obj.optString("simpleText").takeIf { it.isNotBlank() }?.let { return it }
+            val runs = obj.optJSONArray("runs") ?: return ""
+            val sb = StringBuilder()
+            for (i in 0 until runs.length()) {
+                sb.append(runs.optJSONObject(i)?.optString("text").orEmpty())
+            }
+            return sb.toString().trim()
+        }
+    }
 }

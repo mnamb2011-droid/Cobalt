@@ -17,9 +17,11 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -38,6 +40,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -47,8 +50,11 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import coil.ImageLoader
 import coil.compose.AsyncImage
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -289,6 +295,28 @@ private fun probePort(ip: String, port: Int, timeoutMs: Int): Boolean = runCatch
     }
 }.getOrDefault(false)
 
+private fun parseHexColor(hex: String?, fallback: Color): Color {
+    if (hex.isNullOrBlank()) return fallback
+    return runCatching { Color(android.graphics.Color.parseColor(hex)) }.getOrDefault(fallback)
+}
+
+private fun fallbackIconForApp(app: TvApp): ImageVector {
+    val key = "${app.id} ${app.title}".lowercase()
+    return when {
+        "youtube" in key || "cobalt" in key -> Icons.Rounded.SmartDisplay
+        "netflix" in key || "prime" in key || "shahid" in key || "disney" in key || "watch" in key -> Icons.Rounded.Movie
+        "browser" in key || "web" in key -> Icons.Rounded.Public
+        "setting" in key -> Icons.Rounded.Settings
+        "livetv" in key || "tv" in key -> Icons.Rounded.LiveTv
+        "hdmi" in key || "input" in key -> Icons.Rounded.SettingsInputHdmi
+        "music" in key || "spotify" in key || "audio" in key -> Icons.Rounded.MusicNote
+        "photo" in key || "media" in key || "video" in key || "kodi" in key || "plex" in key -> Icons.Rounded.PermMedia
+        "store" in key || "discovery" in key || "content" in key -> Icons.Rounded.ShoppingBag
+        "game" in key -> Icons.Rounded.SportsEsports
+        else -> Icons.Rounded.Apps
+    }
+}
+
 @Composable
 private fun RemoteScreen(
     savedIp: String,
@@ -317,6 +345,20 @@ private fun RemoteScreen(
     var activeTab by remember { mutableStateOf(RemoteTab.REMOTE) }
     var showConnectionPanel by remember { mutableStateOf(savedIp.isBlank()) }
     var connectJob by remember { mutableStateOf<Job?>(null) }
+
+    // In-app YouTube Search Results Sheet state
+    var showYtDialog by remember { mutableStateOf(false) }
+    var ytSearching by remember { mutableStateOf(false) }
+    var ytSearchQuery by remember { mutableStateOf("") }
+    var ytResults by remember { mutableStateOf<List<YouTubeSearchResult>>(emptyList()) }
+    var ytError by remember { mutableStateOf<String?>(null) }
+
+    // Custom Coil ImageLoader that trusts the TV's self-signed TLS certificate so TV app icons load!
+    val tvImageLoader = remember(client) {
+        ImageLoader.Builder(context).apply {
+            client?.let { okHttpClient(it.imageHttpClient()) }
+        }.build()
+    }
 
     val imeQueue = remember { Channel<suspend (WebOsClient) -> Unit>(Channel.UNLIMITED) }
 
@@ -461,7 +503,6 @@ private fun RemoteScreen(
         }
     }
 
-    // Live sync for native webOS text fields (Browser/Store/Settings)
     fun onLiveTextChange(newText: String) {
         val oldText = lastSentText
         typed = newText
@@ -482,26 +523,61 @@ private fun RemoteScreen(
         }
     }
 
-    // Smart Submit: if native webOS IME is focused -> send Enter; otherwise -> open search directly in Cobalt YouTube!
+    fun playVideoOnCobalt(videoId: String, title: String? = null) {
+        command { c ->
+            val fg = c.getForegroundAppId()
+            val ytId = resolveYouTubeAppId(fg)
+            c.playYouTubeVideo(ytId, videoId)
+            status = if (title != null) "جارٍ التشغيل: $title" else "تم إرسال الفيديو إلى كوبالت"
+        }
+    }
+
+    // Smart Submit:
+    // 1) Direct YouTube URL -> plays immediately on Cobalt TV
+    // 2) Native webOS IME active -> sends text + Enter
+    // 3) Search query -> searches YouTube right on phone and opens clickable results to play on Cobalt TV!
     fun submitTextOrYouTubeSearch(forceYouTube: Boolean = false) {
         val query = typed.trim()
-        command { c ->
-            if (!forceYouTube && c.imeFocused) {
-                if (query.isNotEmpty() && lastSentText != query) {
-                    c.insertText(query, replace = true)
-                }
-                c.sendEnter()
-            } else if (query.isNotEmpty()) {
-                val fg = c.getForegroundAppId()
-                val ytId = resolveYouTubeAppId(fg)
-                c.launchYouTubeSearch(ytId, query)
-                status = "تم إرسال البحث إلى يوتيوب: $query"
-            } else {
+        if (query.isEmpty()) {
+            if (imeFocused) command { it.sendEnter() }
+            return
+        }
+
+        val directVideoId = WebOsClient.extractYouTubeVideoId(query)
+        if (directVideoId != null) {
+            playVideoOnCobalt(directVideoId)
+            typed = ""
+            lastSentText = ""
+            return
+        }
+
+        if (!forceYouTube && imeFocused) {
+            command { c ->
+                if (lastSentText != query) c.insertText(query, replace = true)
                 c.sendEnter()
             }
+            typed = ""
+            lastSentText = ""
+            return
         }
-        typed = ""
-        lastSentText = ""
+
+        // Open in-app YouTube Search Results so the user picks any video to play immediately on Cobalt!
+        ytSearchQuery = query
+        showYtDialog = true
+        ytSearching = true
+        ytError = null
+        ytResults = emptyList()
+        scope.launch {
+            runCatching { WebOsClient.searchYouTube(query) }
+                .onSuccess { list ->
+                    ytResults = list
+                    if (list.isEmpty()) ytError = "لم يتم العثور على نتائج لهذا البحث"
+                }
+                .onFailure { err ->
+                    ytError = "تعذر البحث في يوتيوب: ${err.message ?: "تحقق من الإنترنت"}"
+                }
+            ytSearching = false
+        }
     }
 
     Column(
@@ -545,7 +621,7 @@ private fun RemoteScreen(
                     )
                 }
                 Text(
-                    text = if (connected) status else status,
+                    text = status,
                     color = if (connected) Accent else TextMuted,
                     fontSize = 11.sp,
                     maxLines = 1,
@@ -696,7 +772,7 @@ private fun RemoteScreen(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // D-Pad ON TOP (flanked by Back / Exit / Home / Menu)
+                // D-Pad ON TOP
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -740,7 +816,7 @@ private fun RemoteScreen(
                     }
                 }
 
-                // Touchpad BELOW the D-Pad arrows!
+                // Touchpad BELOW D-Pad
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -837,7 +913,7 @@ private fun RemoteScreen(
                 }
             }
         } else {
-            // Apps Grid Tab
+            // Apps Grid Tab with TLS-trusted TV ImageLoader + Smart Colored Icon Fallback
             Column(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -880,6 +956,7 @@ private fun RemoteScreen(
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         items(apps, key = { it.id }) { app ->
+                            val badgeColor = parseHexColor(app.iconColor, SurfaceElevated)
                             Column(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(16.dp))
@@ -892,21 +969,23 @@ private fun RemoteScreen(
                             ) {
                                 Box(
                                     modifier = Modifier
-                                        .size(46.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(SurfaceElevated),
+                                        .size(50.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(badgeColor),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Text(
-                                        text = app.title.take(2).uppercase(),
-                                        color = Accent,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 15.sp
+                                    Icon(
+                                        imageVector = fallbackIconForApp(app),
+                                        contentDescription = app.title,
+                                        tint = Color.White,
+                                        modifier = Modifier.size(26.dp)
                                     )
                                     if (!app.icon.isNullOrBlank()) {
                                         AsyncImage(
                                             model = app.icon,
+                                            imageLoader = tvImageLoader,
                                             contentDescription = app.title,
+                                            contentScale = ContentScale.Crop,
                                             modifier = Modifier.fillMaxSize()
                                         )
                                     }
@@ -926,7 +1005,7 @@ private fun RemoteScreen(
             }
         }
 
-        // 5. Smart Keyboard & Direct Cobalt YouTube Search Dock
+        // 5. Smart Keyboard & YouTube Search Dock
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -944,7 +1023,7 @@ private fun RemoteScreen(
                 singleLine = true,
                 placeholder = {
                     Text(
-                        if (imeFocused) "كتابة مباشرة في التلفزيون…" else "ابحث في كوبالت يوتيوب أو الصق رابطاً…",
+                        if (imeFocused) "كتابة مباشرة في التلفزيون…" else "ابحث في يوتيوب أو الصق رابط فيديو…",
                         fontSize = 12.sp,
                         color = TextMuted
                     )
@@ -973,7 +1052,6 @@ private fun RemoteScreen(
                 }
             )
 
-            // Direct Backspace (for native webOS IME)
             if (imeFocused) {
                 FilledTonalIconButton(
                     onClick = {
@@ -992,7 +1070,6 @@ private fun RemoteScreen(
                 }
             }
 
-            // Direct Cobalt YouTube Search / Video Launch button
             FilledIconButton(
                 onClick = { submitTextOrYouTubeSearch(forceYouTube = !imeFocused) },
                 modifier = Modifier.size(44.dp),
@@ -1007,6 +1084,146 @@ private fun RemoteScreen(
                     contentDescription = if (imeFocused) "إرسال" else "بحث في يوتيوب",
                     modifier = Modifier.size(21.dp)
                 )
+            }
+        }
+    }
+
+    // In-App YouTube Search Results Dialog -> Tap any result to play immediately on Cobalt TV!
+    if (showYtDialog) {
+        Dialog(
+            onDismissRequest = { showYtDialog = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth(0.94f)
+                        .fillMaxHeight(0.82f)
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(SurfaceCard)
+                        .border(1.dp, BorderSubtle, RoundedCornerShape(22.dp))
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
+                            Icon(Icons.Rounded.SmartDisplay, contentDescription = null, tint = YoutubeRed, modifier = Modifier.size(24.dp))
+                            Text(
+                                text = "نتائج: $ytSearchQuery",
+                                color = TextPrimary,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 15.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        IconButton(onClick = { showYtDialog = false }, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Rounded.Close, contentDescription = "إغلاق", tint = TextMuted)
+                        }
+                    }
+
+                    when {
+                        ytSearching -> {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    CircularProgressIndicator(color = YoutubeRed)
+                                    Text("جارٍ البحث في يوتيوب…", color = TextMuted, fontSize = 13.sp)
+                                }
+                            }
+                        }
+                        ytError != null -> {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Text(ytError!!, color = Warning, fontSize = 13.sp, textAlign = TextAlign.Center)
+                            }
+                        }
+                        else -> {
+                            LazyColumn(
+                                modifier = Modifier.fillMaxSize(),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                items(ytResults, key = { it.videoId }) { video ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(14.dp))
+                                            .background(Ink)
+                                            .border(1.dp, BorderSubtle, RoundedCornerShape(14.dp))
+                                            .clickable {
+                                                playVideoOnCobalt(video.videoId, video.title)
+                                                showYtDialog = false
+                                                typed = ""
+                                                lastSentText = ""
+                                            }
+                                            .padding(8.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .width(116.dp)
+                                                .height(66.dp)
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(SurfaceElevated)
+                                        ) {
+                                            AsyncImage(
+                                                model = video.thumbnailUrl,
+                                                contentDescription = video.title,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                            if (video.duration.isNotBlank()) {
+                                                Text(
+                                                    text = video.duration,
+                                                    color = Color.White,
+                                                    fontSize = 10.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    modifier = Modifier
+                                                        .align(Alignment.BottomEnd)
+                                                        .padding(4.dp)
+                                                        .clip(RoundedCornerShape(4.dp))
+                                                        .background(Color.Black.copy(alpha = 0.78f))
+                                                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                                                )
+                                            }
+                                        }
+                                        Column(
+                                            modifier = Modifier.weight(1f),
+                                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                                        ) {
+                                            Text(
+                                                text = video.title,
+                                                color = TextPrimary,
+                                                fontSize = 13.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            if (video.channel.isNotBlank()) {
+                                                Text(
+                                                    text = video.channel,
+                                                    color = TextMuted,
+                                                    fontSize = 11.sp,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                        }
+                                        Icon(
+                                            imageVector = Icons.Rounded.CastConnected,
+                                            contentDescription = "تشغيل على التلفزيون",
+                                            tint = Accent,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
