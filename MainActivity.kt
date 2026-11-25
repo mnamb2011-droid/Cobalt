@@ -120,7 +120,7 @@ class MainActivity : ComponentActivity() {
                             savedIp = prefs.getString("tv_ip", "") ?: "",
                             savedKey = secure.read("client_key"),
                             savedFingerprint = prefs.getString("tv_fingerprint", null),
-                            savedKodiPort = prefs.getInt("kodi_port", 8080),
+                            savedKodiPort = prefs.getInt("kodi_port", 9090),
                             savedKodiUser = prefs.getString("kodi_user", "kodi") ?: "kodi",
                             savedKodiPass = secure.read("kodi_pass") ?: "",
                             savedKodiMoviesJson = prefs.getString("kodi_movies_cache", null),
@@ -395,7 +395,7 @@ private fun RemoteScreen(
     }
 
     val kodiClient = remember(ip, kodiPortText, kodiUser, kodiPass) {
-        val port = kodiPortText.toIntOrNull()?.coerceIn(1, 65535) ?: 8080
+        val port = kodiPortText.toIntOrNull()?.coerceIn(1, 65535) ?: 9090
         if (ip.isBlank()) null else KodiClient(ip.trim(), port, kodiUser.trim(), kodiPass)
     }
 
@@ -461,7 +461,7 @@ private fun RemoteScreen(
             val ready = if (autoLaunch) ensureKodiReady(kodi) else kodi.ping()
             if (!ready) {
                 kodiLoading = false
-                kodiStatus = "كودي غير متصل — افتح كودي وفعّل التحكم عبر HTTP في الإعدادات ← الخدمات ← التحكم"
+                kodiStatus = "كودي غير متصل — تأكد من فتح كودي وتفعيل (التحكم من الأنظمة الأخرى) في الإعدادات ← الخدمات ← التحكم"
                 showKodiSettings = true
                 return@launch
             }
@@ -491,7 +491,7 @@ private fun RemoteScreen(
             val ready = ensureKodiReady(kodi)
             if (!ready) {
                 kodiLoading = false
-                kodiStatus = "تعذر الوصول إلى كودي — تأكد من تفعيل (السماح بالتحكم عن بُعد عبر HTTP) في كودي"
+                kodiStatus = "تعذر الوصول إلى كودي — تأكد من تفعيل (السماح بالتحكم عن بُعد من الأنظمة الأخرى) في كودي"
                 showKodiSettings = true
                 return@launch
             }
@@ -1176,7 +1176,7 @@ private fun RemoteScreen(
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Text(
-                                text = "لتفعيل القائمة من كودي مرة واحدة: الإعدادات ← الخدمات ← التحكم ← السماح بالتحكم عن بُعد عبر HTTP (المنفذ الافتراضي 8080).",
+                                text = "كودي على webOS يعمل تلقائياً عبر WebSocket/TCP على المنفذ 9090 بدون كلمة مرور بعد تفعيل (التحكم من الأنظمة الأخرى) في الإعدادات ← الخدمات ← التحكم.",
                                 fontSize = 11.sp,
                                 color = TextMuted
                             )
@@ -1213,7 +1213,7 @@ private fun RemoteScreen(
                             }
                             Button(
                                 onClick = {
-                                    val port = kodiPortText.toIntOrNull()?.coerceIn(1, 65535) ?: 8080
+                                    val port = kodiPortText.toIntOrNull()?.coerceIn(1, 65535) ?: 9090
                                     onSaveKodi(port, kodiUser.trim(), kodiPass)
                                     showKodiSettings = false
                                     refreshKodiMovies(autoLaunch = true)
