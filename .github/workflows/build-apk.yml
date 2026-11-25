@@ -22,6 +22,7 @@ jobs:
           cp -f AndroidManifest.xml app/src/main/AndroidManifest.xml
           cp -f MainActivity.kt app/src/main/java/com/mnasser/cobaltremote/MainActivity.kt
           cp -f WebOsClient.kt app/src/main/java/com/mnasser/cobaltremote/WebOsClient.kt
+          cp -f KodiClient.kt app/src/main/java/com/mnasser/cobaltremote/KodiClient.kt
           cp -f app-icon.png app/src/main/res/mipmap-nodpi/ic_launcher.png
           cp -f strings.xml app/src/main/res/values/strings.xml
           test -f app/src/main/java/com/mnasser/cobaltremote/MainActivity.kt
@@ -50,6 +51,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: CobaltRemote-1.2-debug-apk
+          name: CobaltRemote-1.5-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
