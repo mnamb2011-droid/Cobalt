@@ -366,6 +366,8 @@ private fun RemoteScreen(
     var certificatePin by remember { mutableStateOf(savedFingerprint) }
     var client by remember { mutableStateOf<WebOsClient?>(null) }
     var apps by remember { mutableStateOf<List<TvApp>>(emptyList()) }
+    var tvInputs by remember { mutableStateOf<List<TvInput>>(emptyList()) }
+    var showInputsDialog by remember { mutableStateOf(false) }
     var volume by remember { mutableFloatStateOf(20f) }
     var activeTab by remember { mutableStateOf(RemoteTab.REMOTE) }
     var showConnectionPanel by remember { mutableStateOf(savedIp.isBlank()) }
@@ -576,6 +578,7 @@ private fun RemoteScreen(
                     status = "متصل • $cleanIp"
                     runCatching { candidate.getVolume()?.let { volume = it.toFloat() } }
                     runCatching { apps = candidate.getApps() }
+                    runCatching { tvInputs = candidate.getExternalInputs() }
                 } else {
                     candidate.disconnect()
                     status = result.exceptionOrNull()?.message ?: "تعذر الاتصال بـ $cleanIp"
@@ -938,9 +941,13 @@ private fun RemoteScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                             SideNavButton(Icons.AutoMirrored.Rounded.ArrowBack, "رجوع") { command { it.button("BACK") } }
-                            SideNavButton(Icons.Rounded.Close, "خروج") { command { it.button("EXIT") } }
+                            SideNavButton(Icons.Rounded.SettingsInputHdmi, "الإدخالات") {
+                                showInputsDialog = true
+                                if (connected) command(false) { tvInputs = it.getExternalInputs() }
+                            }
+                            SideNavButton(Icons.Rounded.Close, "خروج") { transientNotice = null; command { it.button("EXIT") } }
                         }
 
                         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
@@ -972,7 +979,7 @@ private fun RemoteScreen(
 
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                             SideNavButton(Icons.Rounded.Home, "الرئيسية") { transientNotice = null; command { it.button("HOME") } }
-                            SideNavButton(Icons.Rounded.Input, "الإدخالات") { transientNotice = null; command { it.button("INPUT_HUB") } }
+                            SideNavButton(Icons.Rounded.Dashboard, "لوحة المنزل") { transientNotice = null; command { it.button("INPUT_HUB") } }
                             SideNavButton(Icons.Rounded.Menu, "القائمة") { command { it.button("MENU") } }
                         }
                     }
@@ -1497,6 +1504,133 @@ private fun RemoteScreen(
                 )
             }
         }
+        }
+    }
+
+    // TV Inputs Picker Dialog (each input as its own one-tap button)
+    if (showInputsDialog) {
+        Dialog(
+            onDismissRequest = { showInputsDialog = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth(0.90f)
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(SurfaceCard)
+                        .border(1.dp, BorderSubtle, RoundedCornerShape(22.dp))
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Icon(Icons.Rounded.SettingsInputHdmi, contentDescription = null, tint = Accent, modifier = Modifier.size(22.dp))
+                            Text("إدخالات التلفزيون", color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            IconButton(
+                                onClick = { command(false) { tvInputs = it.getExternalInputs() } },
+                                modifier = Modifier.size(36.dp)
+                            ) {
+                                Icon(Icons.Rounded.Refresh, contentDescription = "تحديث", tint = Accent, modifier = Modifier.size(19.dp))
+                            }
+                            IconButton(
+                                onClick = { showInputsDialog = false },
+                                modifier = Modifier.size(36.dp)
+                            ) {
+                                Icon(Icons.Rounded.Close, contentDescription = "إغلاق", tint = TextMuted)
+                            }
+                        }
+                    }
+
+                    // Dynamic HDMI / External Inputs from TV
+                    tvInputs.forEach { input ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Ink)
+                                .border(
+                                    1.dp,
+                                    if (input.connected) Accent.copy(alpha = 0.55f) else BorderSubtle,
+                                    RoundedCornerShape(14.dp)
+                                )
+                                .clickable {
+                                    showInputsDialog = false
+                                    transientNotice = "تم التبديل إلى: ${input.label}"
+                                    command { it.switchInput(input) }
+                                }
+                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (input.connected) Accent.copy(alpha = 0.16f) else SurfaceElevated),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.SettingsInputHdmi,
+                                    contentDescription = null,
+                                    tint = if (input.connected) Accent else TextMuted,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(input.label, color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(input.id.replace("_", " "), color = TextMuted, fontSize = 11.sp)
+                            }
+                            if (input.connected) {
+                                Surface(color = Accent.copy(alpha = 0.16f), shape = CircleShape) {
+                                    Text("متصل", color = Accent, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
+                                }
+                            }
+                        }
+                    }
+
+                    // Quick built-in Live TV & USB Media buttons
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilledTonalButton(
+                            onClick = {
+                                showInputsDialog = false
+                                transientNotice = "التلفاز المباشر"
+                                command { it.launchApp("com.webos.app.livetv") }
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.filledTonalButtonColors(containerColor = SurfaceElevated, contentColor = TextPrimary)
+                        ) {
+                            Icon(Icons.Rounded.LiveTv, contentDescription = null, tint = Accent, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("التلفاز المباشر", fontSize = 12.sp, maxLines = 1)
+                        }
+                        FilledTonalButton(
+                            onClick = {
+                                showInputsDialog = false
+                                transientNotice = "مشغّل الوسائط / USB"
+                                command { it.launchApp("com.webos.app.photovideo") }
+                            },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.filledTonalButtonColors(containerColor = SurfaceElevated, contentColor = TextPrimary)
+                        ) {
+                            Icon(Icons.Rounded.PermMedia, contentDescription = null, tint = KodiBlue, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("وسائط / USB", fontSize = 12.sp, maxLines = 1)
+                        }
+                    }
+                }
+            }
         }
     }
 

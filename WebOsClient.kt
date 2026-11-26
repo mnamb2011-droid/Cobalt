@@ -24,6 +24,13 @@ data class TvApp(
     val iconColor: String? = null
 )
 
+data class TvInput(
+    val id: String,
+    val label: String,
+    val appId: String?,
+    val connected: Boolean
+)
+
 data class YouTubeSearchResult(
     val videoId: String,
     val title: String,
@@ -371,6 +378,35 @@ class WebOsClient(
                 }
             }
         }.sortedBy { it.title.lowercase() }
+    }
+
+    suspend fun getExternalInputs(): List<TvInput> {
+        val arr = request("tv/getExternalInputList")
+            .optJSONObject("payload")
+            ?.optJSONArray("devices") ?: JSONArray()
+        return (0 until arr.length()).mapNotNull { i ->
+            arr.optJSONObject(i)?.let { d ->
+                val id = d.optString("id").takeIf { it.isNotBlank() } ?: return@let null
+                TvInput(
+                    id = id,
+                    label = d.optString("label").ifBlank { id },
+                    appId = d.optString("appId").takeIf { it.isNotBlank() },
+                    connected = d.optBoolean("connected", false)
+                )
+            }
+        }
+    }
+
+    suspend fun switchInput(input: TvInput) {
+        try {
+            request("tv/switchInput", JSONObject().put("inputId", input.id))
+        } catch (_: WebOsCommandException) {
+            if (!input.appId.isNullOrBlank()) {
+                launchApp(input.appId)
+            } else {
+                throw WebOsCommandException("تعذر التبديل إلى ${input.label}")
+            }
+        }
     }
 
     suspend fun launchApp(appId: String) {
