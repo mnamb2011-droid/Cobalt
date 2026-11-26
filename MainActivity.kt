@@ -19,6 +19,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -48,8 +49,6 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
@@ -87,6 +86,7 @@ private val TextPrimary = Color(0xFFF3F6FB)
 private val TextMuted = Color(0xFF94A3B8)
 
 private enum class RemoteTab { REMOTE, KODI, APPS }
+private enum class KodiSection { MOVIES, SERIES }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -120,10 +120,8 @@ class MainActivity : ComponentActivity() {
                             savedIp = prefs.getString("tv_ip", "") ?: "",
                             savedKey = secure.read("client_key"),
                             savedFingerprint = prefs.getString("tv_fingerprint", null),
-                            savedKodiPort = prefs.getInt("kodi_port", 9090),
-                            savedKodiUser = prefs.getString("kodi_user", "kodi") ?: "kodi",
-                            savedKodiPass = secure.read("kodi_pass") ?: "",
                             savedKodiMoviesJson = prefs.getString("kodi_movies_cache", null),
+                            savedKodiShowsJson = prefs.getString("kodi_shows_cache", null),
                             onSave = { ip, key, fp ->
                                 prefs.edit()
                                     .putString("tv_ip", ip)
@@ -131,15 +129,11 @@ class MainActivity : ComponentActivity() {
                                     .apply()
                                 secure.write("client_key", key)
                             },
-                            onSaveKodi = { port, user, pass ->
-                                prefs.edit()
-                                    .putInt("kodi_port", port)
-                                    .putString("kodi_user", user)
-                                    .apply()
-                                if (pass.isNotEmpty()) secure.write("kodi_pass", pass) else secure.remove("kodi_pass")
-                            },
                             onCacheKodiMovies = { json ->
                                 prefs.edit().putString("kodi_movies_cache", json).apply()
+                            },
+                            onCacheKodiShows = { json ->
+                                prefs.edit().putString("kodi_shows_cache", json).apply()
                             },
                             onClear = {
                                 secure.remove("client_key")
@@ -341,13 +335,11 @@ private fun RemoteScreen(
     savedIp: String,
     savedKey: String?,
     savedFingerprint: String?,
-    savedKodiPort: Int,
-    savedKodiUser: String,
-    savedKodiPass: String,
     savedKodiMoviesJson: String?,
+    savedKodiShowsJson: String?,
     onSave: (String, String, String?) -> Unit,
-    onSaveKodi: (Int, String, String) -> Unit,
     onCacheKodiMovies: (String) -> Unit,
+    onCacheKodiShows: (String) -> Unit,
     onClear: () -> Unit
 ) {
     val context = LocalContext.current
@@ -371,15 +363,19 @@ private fun RemoteScreen(
     var showConnectionPanel by remember { mutableStateOf(savedIp.isBlank()) }
     var connectJob by remember { mutableStateOf<Job?>(null) }
 
-    // Kodi Movies Library State
-    var kodiPortText by remember { mutableStateOf(savedKodiPort.toString()) }
-    var kodiUser by remember { mutableStateOf(savedKodiUser) }
-    var kodiPass by remember { mutableStateOf(savedKodiPass) }
-    var showKodiSettings by remember { mutableStateOf(false) }
+    // Kodi Movies & TV Shows State (Port 9090 automatic, zero settings clutter!)
+    var kodiSection by remember { mutableStateOf(KodiSection.MOVIES) }
     var kodiMovies by remember { mutableStateOf(KodiClient.deserializeMovies(savedKodiMoviesJson)) }
+    var kodiShows by remember { mutableStateOf(KodiClient.deserializeShows(savedKodiShowsJson)) }
     var kodiFilter by remember { mutableStateOf("") }
     var kodiLoading by remember { mutableStateOf(false) }
     var kodiStatus by remember { mutableStateOf<String?>(null) }
+
+    // Selected TV Show Episodes Dialog
+    var selectedShow by remember { mutableStateOf<KodiShow?>(null) }
+    var showEpisodes by remember { mutableStateOf<List<KodiEpisode>>(emptyList()) }
+    var episodesLoading by remember { mutableStateOf(false) }
+    var selectedSeason by remember { mutableIntStateOf(-1) }
 
     // YouTube Search Dialog State
     var showYtDialog by remember { mutableStateOf(false) }
@@ -394,15 +390,8 @@ private fun RemoteScreen(
         }.build()
     }
 
-    val kodiClient = remember(ip, kodiPortText, kodiUser, kodiPass) {
-        val port = kodiPortText.toIntOrNull()?.coerceIn(1, 65535) ?: 9090
-        if (ip.isBlank()) null else KodiClient(ip.trim(), port, kodiUser.trim(), kodiPass)
-    }
-
-    val kodiImageLoader = remember(kodiClient) {
-        ImageLoader.Builder(context).apply {
-            kodiClient?.let { okHttpClient(it.imageHttpClient()) }
-        }.build()
+    val kodiClient = remember(ip) {
+        if (ip.isBlank()) null else KodiClient(ip.trim(), 9090)
     }
 
     val imeQueue = remember { Channel<suspend (WebOsClient) -> Unit>(Channel.UNLIMITED) }
@@ -437,7 +426,6 @@ private fun RemoteScreen(
         return "org.xbmc.kodi"
     }
 
-    /** Ensures Kodi is running on the LG TV (auto-launches it if closed) and waits until JSON-RPC answers. */
     suspend fun ensureKodiReady(kodi: KodiClient): Boolean {
         if (kodi.ping()) return true
         val tv = client ?: return false
@@ -450,60 +438,94 @@ private fun RemoteScreen(
         return false
     }
 
-    fun refreshKodiMovies(autoLaunch: Boolean = false) {
+    fun refreshKodiLibrary(autoLaunch: Boolean = false) {
         val kodi = kodiClient ?: run {
             kodiStatus = "اتصل بالتلفزيون أولاً"
             return
         }
         scope.launch {
             kodiLoading = true
-            kodiStatus = "جارٍ جلب أفلام كودي…"
+            kodiStatus = "جارٍ جلب مكتبة كودي…"
             val ready = if (autoLaunch) ensureKodiReady(kodi) else kodi.ping()
             if (!ready) {
                 kodiLoading = false
-                kodiStatus = "كودي غير متصل — تأكد من فتح كودي وتفعيل (التحكم من الأنظمة الأخرى) في الإعدادات ← الخدمات ← التحكم"
-                showKodiSettings = true
+                kodiStatus = "كودي غير مفتوح — اضغط تحديث لتشغيله تلقائياً"
                 return@launch
             }
-            runCatching { kodi.getMovies() }
-                .onSuccess { list ->
-                    kodiMovies = list
-                    onCacheKodiMovies(KodiClient.serializeMovies(list))
-                    kodiStatus = if (list.isEmpty()) "مكتبة الأفلام في كودي فارغة" else "تم تحديث ${list.size} فيلم من كودي"
-                }
-                .onFailure { err ->
-                    kodiStatus = err.message ?: "تعذر قراءة أفلام كودي"
-                    showKodiSettings = true
-                }
+            val moviesRes = runCatching { kodi.getMovies() }
+            val showsRes = runCatching { kodi.getTvShows() }
+            moviesRes.onSuccess { list ->
+                kodiMovies = list
+                onCacheKodiMovies(KodiClient.serializeMovies(list))
+            }
+            showsRes.onSuccess { list ->
+                kodiShows = list
+                onCacheKodiShows(KodiClient.serializeShows(list))
+            }
             kodiLoading = false
+            kodiStatus = "تم التحديث: ${kodiMovies.size} فيلم • ${kodiShows.size} مسلسل"
         }
     }
 
     fun playKodiMovieDirectly(movie: KodiMovie) {
-        val kodi = kodiClient ?: run {
-            status = "اتصل بالتلفزيون أولاً"
-            return
-        }
+        val kodi = kodiClient ?: return
         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
         scope.launch {
             kodiLoading = true
             kodiStatus = "جارٍ تشغيل: ${movie.title}…"
-            val ready = ensureKodiReady(kodi)
-            if (!ready) {
+            if (!ensureKodiReady(kodi)) {
                 kodiLoading = false
-                kodiStatus = "تعذر الوصول إلى كودي — تأكد من تفعيل (السماح بالتحكم عن بُعد من الأنظمة الأخرى) في كودي"
-                showKodiSettings = true
+                kodiStatus = "تعذر الوصول إلى كودي — تأكد من تفعيل التحكم من الأنظمة الأخرى"
                 return@launch
             }
             runCatching { kodi.playMovie(movie.movieId, movie.file) }
                 .onSuccess {
-                    status = "يُعرض الآن في كودي: ${movie.title}"
-                    kodiStatus = "تم تشغيل الفيلم على الشاشة: ${movie.title}"
+                    status = "يُعرض الآن: ${movie.title}"
+                    kodiStatus = "تم تشغيل الفيلم: ${movie.title}"
                 }
-                .onFailure { err ->
-                    kodiStatus = "تعذر تشغيل الفيلم: ${err.message}"
-                }
+                .onFailure { kodiStatus = "تعذر تشغيل الفيلم: ${it.message}" }
             kodiLoading = false
+        }
+    }
+
+    fun openShowEpisodes(show: KodiShow) {
+        val kodi = kodiClient ?: return
+        selectedShow = show
+        showEpisodes = emptyList()
+        selectedSeason = -1
+        episodesLoading = true
+        scope.launch {
+            if (!ensureKodiReady(kodi)) {
+                episodesLoading = false
+                kodiStatus = "تعذر الاتصال بكودي لجلب الحلقات"
+                return@launch
+            }
+            runCatching { kodi.getEpisodes(show.tvshowId) }
+                .onSuccess { eps ->
+                    showEpisodes = eps
+                    selectedSeason = eps.map { it.season }.distinct().minOrNull() ?: -1
+                }
+                .onFailure { kodiStatus = "تعذر جلب الحلقات: ${it.message}" }
+            episodesLoading = false
+        }
+    }
+
+    fun playKodiEpisodeDirectly(ep: KodiEpisode, showTitle: String) {
+        val kodi = kodiClient ?: return
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        scope.launch {
+            kodiStatus = "جارٍ تشغيل: $showTitle - ح${ep.episode}…"
+            if (!ensureKodiReady(kodi)) {
+                kodiStatus = "تعذر الوصول إلى كودي"
+                return@launch
+            }
+            runCatching { kodi.playEpisode(ep.episodeId, ep.file) }
+                .onSuccess {
+                    status = "يُعرض الآن: $showTitle (م${ep.season} ح${ep.episode})"
+                    kodiStatus = "تم تشغيل الحلقة ${ep.episode} من $showTitle"
+                    selectedShow = null
+                }
+                .onFailure { kodiStatus = "تعذر تشغيل الحلقة: ${it.message}" }
         }
     }
 
@@ -773,7 +795,7 @@ private fun RemoteScreen(
             }
         }
 
-        // 2. Collapsible Connection Panel
+        // 2. Collapsible TV Connection Panel
         AnimatedVisibility(visible = showConnectionPanel) {
             Column(
                 modifier = Modifier
@@ -853,7 +875,7 @@ private fun RemoteScreen(
             }
         }
 
-        // 3. 3-Tab Mode Switcher (Remote | Kodi Movies | TV Apps)
+        // 3. 3-Tab Mode Switcher (Remote | Kodi | TV Apps)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -871,15 +893,15 @@ private fun RemoteScreen(
             ) { activeTab = RemoteTab.REMOTE }
 
             TabPill(
-                label = if (kodiMovies.isNotEmpty()) "أفلام كودي (${kodiMovies.size})" else "أفلام كودي",
+                label = "كودي",
                 icon = Icons.Rounded.LocalMovies,
                 selected = activeTab == RemoteTab.KODI,
                 accentColor = KodiBlue,
-                modifier = Modifier.weight(1.2f)
+                modifier = Modifier.weight(1f)
             ) {
                 activeTab = RemoteTab.KODI
-                if (kodiMovies.isEmpty() && !kodiLoading && ip.isNotBlank()) {
-                    refreshKodiMovies(autoLaunch = false)
+                if (kodiMovies.isEmpty() && kodiShows.isEmpty() && !kodiLoading && ip.isNotBlank()) {
+                    refreshKodiLibrary(autoLaunch = false)
                 }
             }
 
@@ -946,7 +968,7 @@ private fun RemoteScreen(
                         }
                     }
 
-                    // Touchpad + Dedicated Magic-Remote Scroll Wheel Replacement BELOW D-Pad!
+                    // Touchpad + Dedicated Vertical Scroll Wheel BELOW D-Pad
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -954,7 +976,6 @@ private fun RemoteScreen(
                             .heightIn(min = 120.dp),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        // Touchpad
                         Box(
                             modifier = Modifier
                                 .weight(1f)
@@ -989,7 +1010,6 @@ private fun RemoteScreen(
                             }
                         }
 
-                        // Dedicated Vertical Scroll Wheel (LG Magic Remote Wheel Replacement)
                         Column(
                             modifier = Modifier
                                 .width(64.dp)
@@ -1117,115 +1137,83 @@ private fun RemoteScreen(
             }
 
             RemoteTab.KODI -> {
-                // Direct Kodi Movies Library Tab
+                // Clean Kodi Library Tab (Movies + TV Series, no Port/Password clutter!)
                 Column(
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    // Movies / Series sub-tabs + Refresh
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        OutlinedTextField(
-                            value = kodiFilter,
-                            onValueChange = { kodiFilter = it },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            placeholder = { Text("ابحث في أفلامك داخل كودي…", fontSize = 12.sp, color = TextMuted) },
-                            textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = TextPrimary),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = KodiBlue,
-                                unfocusedBorderColor = BorderSubtle,
-                                focusedContainerColor = SurfaceCard,
-                                unfocusedContainerColor = SurfaceCard
-                            ),
-                            leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null, tint = KodiBlue, modifier = Modifier.size(18.dp)) }
-                        )
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(SurfaceCard)
+                                .padding(3.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            TabPill(
+                                label = "الأفلام (${kodiMovies.size})",
+                                icon = Icons.Rounded.Movie,
+                                selected = kodiSection == KodiSection.MOVIES,
+                                accentColor = KodiBlue,
+                                modifier = Modifier.weight(1f)
+                            ) { kodiSection = KodiSection.MOVIES }
+
+                            TabPill(
+                                label = "المسلسلات (${kodiShows.size})",
+                                icon = Icons.Rounded.Tv,
+                                selected = kodiSection == KodiSection.SERIES,
+                                accentColor = KodiBlue,
+                                modifier = Modifier.weight(1f)
+                            ) { kodiSection = KodiSection.SERIES }
+                        }
+
                         FilledTonalIconButton(
-                            onClick = { refreshKodiMovies(autoLaunch = true) },
+                            onClick = { refreshKodiLibrary(autoLaunch = true) },
                             enabled = !kodiLoading,
-                            modifier = Modifier.size(46.dp),
+                            modifier = Modifier.size(40.dp),
                             shape = RoundedCornerShape(12.dp),
                             colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = SurfaceCard, contentColor = KodiBlue)
                         ) {
-                            Icon(Icons.Rounded.Refresh, contentDescription = "تحديث الأفلام", modifier = Modifier.size(20.dp))
-                        }
-                        FilledTonalIconButton(
-                            onClick = { showKodiSettings = !showKodiSettings },
-                            modifier = Modifier.size(46.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = IconButtonDefaults.filledTonalIconButtonColors(
-                                containerColor = if (showKodiSettings) SurfaceElevated else SurfaceCard,
-                                contentColor = TextPrimary
-                            )
-                        ) {
-                            Icon(Icons.Rounded.Tune, contentDescription = "إعدادات كودي", modifier = Modifier.size(20.dp))
+                            Icon(Icons.Rounded.Refresh, contentDescription = "تحديث مكتبة كودي", modifier = Modifier.size(20.dp))
                         }
                     }
 
-                    AnimatedVisibility(visible = showKodiSettings) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(SurfaceCard)
-                                .border(1.dp, BorderSubtle, RoundedCornerShape(14.dp))
-                                .padding(10.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
+                    // Compact filter search bar
+                    OutlinedTextField(
+                        value = kodiFilter,
+                        onValueChange = { kodiFilter = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        placeholder = {
                             Text(
-                                text = "كودي على webOS يعمل تلقائياً عبر WebSocket/TCP على المنفذ 9090 بدون كلمة مرور بعد تفعيل (التحكم من الأنظمة الأخرى) في الإعدادات ← الخدمات ← التحكم.",
-                                fontSize = 11.sp,
+                                if (kodiSection == KodiSection.MOVIES) "ابحث في الأفلام بالاسم أو السنة…" else "ابحث في المسلسلات…",
+                                fontSize = 12.sp,
                                 color = TextMuted
                             )
-                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                OutlinedTextField(
-                                    value = kodiPortText,
-                                    onValueChange = { kodiPortText = it.filter(Char::isDigit).take(5) },
-                                    modifier = Modifier.weight(0.8f),
-                                    singleLine = true,
-                                    label = { Text("المنفذ", fontSize = 10.sp) },
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                    textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = TextPrimary),
-                                    shape = RoundedCornerShape(10.dp)
-                                )
-                                OutlinedTextField(
-                                    value = kodiUser,
-                                    onValueChange = { kodiUser = it },
-                                    modifier = Modifier.weight(1f),
-                                    singleLine = true,
-                                    label = { Text("المستخدم", fontSize = 10.sp) },
-                                    textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = TextPrimary),
-                                    shape = RoundedCornerShape(10.dp)
-                                )
-                                OutlinedTextField(
-                                    value = kodiPass,
-                                    onValueChange = { kodiPass = it },
-                                    modifier = Modifier.weight(1f),
-                                    singleLine = true,
-                                    label = { Text("كلمة المرور", fontSize = 10.sp) },
-                                    visualTransformation = PasswordVisualTransformation(),
-                                    textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = TextPrimary),
-                                    shape = RoundedCornerShape(10.dp)
-                                )
-                            }
-                            Button(
-                                onClick = {
-                                    val port = kodiPortText.toIntOrNull()?.coerceIn(1, 65535) ?: 9090
-                                    onSaveKodi(port, kodiUser.trim(), kodiPass)
-                                    showKodiSettings = false
-                                    refreshKodiMovies(autoLaunch = true)
-                                },
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(10.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = KodiBlue, contentColor = Ink)
-                            ) {
-                                Text("حفظ وجلب أفلام كودي", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        },
+                        textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = TextPrimary),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = KodiBlue,
+                            unfocusedBorderColor = BorderSubtle,
+                            focusedContainerColor = SurfaceCard,
+                            unfocusedContainerColor = SurfaceCard
+                        ),
+                        leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null, tint = KodiBlue, modifier = Modifier.size(18.dp)) },
+                        trailingIcon = {
+                            if (kodiFilter.isNotEmpty()) {
+                                IconButton(onClick = { kodiFilter = "" }) {
+                                    Icon(Icons.Rounded.Close, contentDescription = "مسح", tint = TextMuted, modifier = Modifier.size(16.dp))
+                                }
                             }
                         }
-                    }
+                    )
 
                     kodiStatus?.let { msg ->
                         Row(
@@ -1236,113 +1224,87 @@ private fun RemoteScreen(
                             if (kodiLoading) {
                                 CircularProgressIndicator(color = KodiBlue, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
                             }
-                            Text(msg, color = KodiBlue, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text(msg, color = KodiBlue, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
 
-                    val filteredMovies = remember(kodiMovies, kodiFilter) {
-                        val q = kodiFilter.trim()
-                        if (q.isEmpty()) kodiMovies
-                        else kodiMovies.filter { it.title.contains(q, true) || it.year.toString().contains(q) }
-                    }
-
-                    if (filteredMovies.isEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .clip(RoundedCornerShape(18.dp))
-                                .background(SurfaceCard)
-                                .padding(16.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                Icon(Icons.Rounded.LocalMovies, contentDescription = null, tint = KodiBlue.copy(alpha = 0.7f), modifier = Modifier.size(40.dp))
-                                Text(
-                                    text = if (kodiMovies.isEmpty()) "اضغط الزر بالأسفل لتشغيل كودي وجلب قائمة أفلامك وحفظها هنا" else "لا توجد أفلام مطابقة للبحث",
-                                    color = TextMuted,
-                                    fontSize = 13.sp,
-                                    textAlign = TextAlign.Center
-                                )
-                                if (kodiMovies.isEmpty()) {
-                                    Button(
-                                        onClick = { refreshKodiMovies(autoLaunch = true) },
-                                        enabled = !kodiLoading,
-                                        shape = RoundedCornerShape(12.dp),
-                                        colors = ButtonDefaults.buttonColors(containerColor = KodiBlue, contentColor = Ink)
-                                    ) {
-                                        Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-                                        Spacer(Modifier.width(6.dp))
-                                        Text("جلب قائمة أفلام كودي", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    if (kodiSection == KodiSection.MOVIES) {
+                        val filteredMovies = remember(kodiMovies, kodiFilter) {
+                            val q = kodiFilter.trim()
+                            if (q.isEmpty()) kodiMovies
+                            else kodiMovies.filter {
+                                it.title.contains(q, true) || it.originalTitle.contains(q, true) || it.year.toString().contains(q)
+                            }
+                        }
+                        if (filteredMovies.isEmpty()) {
+                            EmptyKodiState(
+                                hasCache = kodiMovies.isNotEmpty(),
+                                loading = kodiLoading,
+                                label = "أفلام",
+                                onRefresh = { refreshKodiLibrary(autoLaunch = true) }
+                            )
+                        } else {
+                            LazyVerticalGrid(
+                                columns = GridCells.Fixed(3),
+                                modifier = Modifier.fillMaxSize(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                items(filteredMovies, key = { it.movieId }) { movie ->
+                                    val durationText = remember(movie.runtimeSec) { KodiClient.formatRuntime(movie.runtimeSec) }
+                                    val metaBadge = remember(movie.year, durationText) {
+                                        listOfNotNull(
+                                            movie.year.takeIf { it > 0 }?.toString(),
+                                            durationText.takeIf { it.isNotEmpty() }
+                                        ).joinToString(" • ")
                                     }
+                                    KodiPosterCard(
+                                        title = movie.title,
+                                        fallbackQuery = movie.originalTitle,
+                                        isSeries = false,
+                                        initialPosterUrl = movie.posterUrl,
+                                        topBadge = metaBadge,
+                                        onClick = { playKodiMovieDirectly(movie) }
+                                    )
                                 }
                             }
                         }
                     } else {
-                        LazyVerticalGrid(
-                            columns = GridCells.Fixed(3),
-                            modifier = Modifier.fillMaxSize(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            items(filteredMovies, key = { it.movieId }) { movie ->
-                                Column(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(14.dp))
-                                        .background(SurfaceCard)
-                                        .border(1.dp, BorderSubtle, RoundedCornerShape(14.dp))
-                                        .clickable { playKodiMovieDirectly(movie) }
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .aspectRatio(0.68f)
-                                            .background(SurfaceElevated),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(Icons.Rounded.Movie, contentDescription = null, tint = KodiBlue.copy(alpha = 0.5f), modifier = Modifier.size(34.dp))
-                                        if (!movie.posterUrl.isNullOrBlank()) {
-                                            AsyncImage(
-                                                model = movie.posterUrl,
-                                                imageLoader = kodiImageLoader,
-                                                contentDescription = movie.title,
-                                                contentScale = ContentScale.Crop,
-                                                modifier = Modifier.fillMaxSize()
-                                            )
-                                        }
-                                        if (movie.year > 0) {
-                                            Text(
-                                                text = movie.year.toString(),
-                                                color = Color.White,
-                                                fontSize = 9.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                modifier = Modifier
-                                                    .align(Alignment.TopEnd)
-                                                    .padding(4.dp)
-                                                    .clip(RoundedCornerShape(5.dp))
-                                                    .background(Color.Black.copy(alpha = 0.75f))
-                                                    .padding(horizontal = 5.dp, vertical = 1.dp)
-                                            )
-                                        }
-                                        Box(
-                                            modifier = Modifier
-                                                .align(Alignment.BottomStart)
-                                                .padding(5.dp)
-                                                .size(26.dp)
-                                                .clip(CircleShape)
-                                                .background(KodiBlue.copy(alpha = 0.92f)),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            Icon(Icons.Rounded.PlayArrow, contentDescription = "تشغيل", tint = Ink, modifier = Modifier.size(18.dp))
-                                        }
+                        val filteredShows = remember(kodiShows, kodiFilter) {
+                            val q = kodiFilter.trim()
+                            if (q.isEmpty()) kodiShows
+                            else kodiShows.filter {
+                                it.title.contains(q, true) || it.originalTitle.contains(q, true) || it.year.toString().contains(q)
+                            }
+                        }
+                        if (filteredShows.isEmpty()) {
+                            EmptyKodiState(
+                                hasCache = kodiShows.isNotEmpty(),
+                                loading = kodiLoading,
+                                label = "مسلسلات",
+                                onRefresh = { refreshKodiLibrary(autoLaunch = true) }
+                            )
+                        } else {
+                            LazyVerticalGrid(
+                                columns = GridCells.Fixed(3),
+                                modifier = Modifier.fillMaxSize(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                items(filteredShows, key = { it.tvshowId }) { show ->
+                                    val metaBadge = remember(show.year, show.episodeCount) {
+                                        listOfNotNull(
+                                            show.year.takeIf { it > 0 }?.toString(),
+                                            show.episodeCount.takeIf { it > 0 }?.let { "${it} ح" }
+                                        ).joinToString(" • ")
                                     }
-                                    Text(
-                                        text = movie.title,
-                                        color = TextPrimary,
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.SemiBold,
-                                        maxLines = 2,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp)
+                                    KodiPosterCard(
+                                        title = show.title,
+                                        fallbackQuery = show.originalTitle,
+                                        isSeries = true,
+                                        initialPosterUrl = show.posterUrl,
+                                        topBadge = metaBadge,
+                                        onClick = { openShowEpisodes(show) }
                                     )
                                 }
                             }
@@ -1352,7 +1314,6 @@ private fun RemoteScreen(
             }
 
             RemoteTab.APPS -> {
-                // Apps Grid Tab
                 Column(
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -1528,6 +1489,116 @@ private fun RemoteScreen(
         }
     }
 
+    // TV Show Episodes Picker Dialog
+    selectedShow?.let { show ->
+        val seasons = remember(showEpisodes) { showEpisodes.map { it.season }.distinct().sorted() }
+        val visibleEpisodes = remember(showEpisodes, selectedSeason) {
+            if (selectedSeason < 0) showEpisodes else showEpisodes.filter { it.season == selectedSeason }
+        }
+        Dialog(
+            onDismissRequest = { selectedShow = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth(0.94f)
+                        .fillMaxHeight(0.80f)
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(SurfaceCard)
+                        .border(1.dp, BorderSubtle, RoundedCornerShape(22.dp))
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
+                            Icon(Icons.Rounded.Tv, contentDescription = null, tint = KodiBlue, modifier = Modifier.size(22.dp))
+                            Text(show.title, color = TextPrimary, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        IconButton(onClick = { selectedShow = null }, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Rounded.Close, contentDescription = "إغلاق", tint = TextMuted)
+                        }
+                    }
+
+                    if (seasons.size > 1) {
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            items(seasons) { s ->
+                                FilterChip(
+                                    selected = selectedSeason == s,
+                                    onClick = { selectedSeason = s },
+                                    label = { Text("الموسم $s", fontSize = 12.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = KodiBlue,
+                                        selectedLabelColor = Ink
+                                    )
+                                )
+                            }
+                        }
+                    }
+
+                    when {
+                        episodesLoading -> {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                CircularProgressIndicator(color = KodiBlue)
+                            }
+                        }
+                        visibleEpisodes.isEmpty() -> {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                Text("لا توجد حلقات متاحة لهذا المسلسل", color = TextMuted, fontSize = 13.sp)
+                            }
+                        }
+                        else -> {
+                            LazyColumn(
+                                modifier = Modifier.fillMaxSize(),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                items(visibleEpisodes, key = { it.episodeId }) { ep ->
+                                    val dur = remember(ep.runtimeSec) { KodiClient.formatRuntime(ep.runtimeSec) }
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(14.dp))
+                                            .background(Ink)
+                                            .border(1.dp, BorderSubtle, RoundedCornerShape(14.dp))
+                                            .clickable { playKodiEpisodeDirectly(ep, show.title) }
+                                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(36.dp)
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(KodiBlue.copy(alpha = 0.18f)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Text("${ep.episode}", color = KodiBlue, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                        }
+                                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                            Text(ep.title, color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                Text("الموسم ${ep.season} • الحلقة ${ep.episode}", color = TextMuted, fontSize = 11.sp)
+                                                if (dur.isNotEmpty()) Text("• $dur", color = Accent, fontSize = 11.sp)
+                                            }
+                                        }
+                                        if (ep.playcount > 0) {
+                                            Icon(Icons.Rounded.CheckCircle, contentDescription = "تمت المشاهدة", tint = Accent.copy(alpha = 0.8f), modifier = Modifier.size(18.dp))
+                                        }
+                                        Icon(Icons.Rounded.PlayArrow, contentDescription = "تشغيل", tint = KodiBlue, modifier = Modifier.size(22.dp))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // In-App YouTube Search Results Dialog
     if (showYtDialog) {
         Dialog(
@@ -1663,6 +1734,136 @@ private fun RemoteScreen(
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun KodiPosterCard(
+    title: String,
+    fallbackQuery: String,
+    isSeries: Boolean,
+    initialPosterUrl: String?,
+    topBadge: String,
+    onClick: () -> Unit
+) {
+    var resolvedPoster by remember(initialPosterUrl, fallbackQuery) { mutableStateOf(initialPosterUrl) }
+
+    // If Kodi only had a local USB path and no IMDb ID, lazily look up the poster online by title!
+    LaunchedEffect(initialPosterUrl, fallbackQuery) {
+        if (resolvedPoster.isNullOrBlank() && fallbackQuery.isNotBlank()) {
+            resolvedPoster = KodiClient.searchPosterByTitle(fallbackQuery, isSeries)
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(SurfaceCard)
+            .border(1.dp, BorderSubtle, RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(0.68f)
+                .background(SurfaceElevated),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = if (isSeries) Icons.Rounded.Tv else Icons.Rounded.Movie,
+                contentDescription = null,
+                tint = KodiBlue.copy(alpha = 0.45f),
+                modifier = Modifier.size(34.dp)
+            )
+            if (!resolvedPoster.isNullOrBlank()) {
+                AsyncImage(
+                    model = resolvedPoster,
+                    contentDescription = title,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+            if (topBadge.isNotBlank()) {
+                Text(
+                    text = topBadge,
+                    color = Color.White,
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(4.dp)
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(Color.Black.copy(alpha = 0.78f))
+                        .padding(horizontal = 5.dp, vertical = 2.dp)
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(5.dp)
+                    .size(26.dp)
+                    .clip(CircleShape)
+                    .background(KodiBlue.copy(alpha = 0.92f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = if (isSeries) Icons.Rounded.PlaylistPlay else Icons.Rounded.PlayArrow,
+                    contentDescription = if (isSeries) "الحلقات" else "تشغيل",
+                    tint = Ink,
+                    modifier = Modifier.size(17.dp)
+                )
+            }
+        }
+        Text(
+            text = title,
+            color = TextPrimary,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 6.dp)
+        )
+    }
+}
+
+@Composable
+private fun EmptyKodiState(
+    hasCache: Boolean,
+    loading: Boolean,
+    label: String,
+    onRefresh: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .clip(RoundedCornerShape(18.dp))
+            .background(SurfaceCard)
+            .padding(16.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Icon(Icons.Rounded.LocalMovies, contentDescription = null, tint = KodiBlue.copy(alpha = 0.7f), modifier = Modifier.size(40.dp))
+            Text(
+                text = if (!hasCache) "اضغط الزر بالأسفل لتشغيل كودي وجلب قائمة ال$label وحفظها هنا" else "لا توجد نتائج مطابقة للبحث",
+                color = TextMuted,
+                fontSize = 13.sp,
+                textAlign = TextAlign.Center
+            )
+            if (!hasCache) {
+                Button(
+                    onClick = onRefresh,
+                    enabled = !loading,
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = KodiBlue, contentColor = Ink)
+                ) {
+                    Icon(Icons.Rounded.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("جلب مكتبة كودي", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 }
             }
         }
