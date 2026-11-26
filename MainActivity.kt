@@ -584,7 +584,7 @@ private fun RemoteScreen(
         }
     }
 
-    fun playKodiOnPhone(title: String, filePath: String) {
+    fun playKodiOnPhone(title: String, filePath: String, movieId: Int? = null, episodeId: Int? = null) {
         val kodi = kodiClient ?: run {
             kodiStatus = "اتصل بالتلفزيون أولاً"
             return
@@ -598,7 +598,7 @@ private fun RemoteScreen(
                 kodiStatus = "تعذر الاتصال بكودي لتشغيل الفيديو على الهاتف"
                 return@launch
             }
-            val url = kodi.resolvePhoneStreamUrl(title, filePath)
+            val url = kodi.resolvePhoneStreamUrl(context, title, filePath, movieId, episodeId)
             kodiLoading = false
             if (url != null) {
                 streamUrl = url
@@ -1425,7 +1425,7 @@ private fun RemoteScreen(
                                         initialPosterUrl = movie.posterUrl,
                                         topBadge = metaBadge,
                                         onClick = { playKodiMovieDirectly(movie) },
-                                        onPlayOnPhone = { playKodiOnPhone(movie.title, movie.file) }
+                                        onPlayOnPhone = { playKodiOnPhone(movie.title, movie.file, movieId = movie.movieId) }
                                     )
                                 }
                             }
@@ -1938,7 +1938,7 @@ private fun RemoteScreen(
                                             Icon(Icons.Rounded.CheckCircle, contentDescription = "تمت المشاهدة", tint = Accent.copy(alpha = 0.8f), modifier = Modifier.size(18.dp))
                                         }
                                         IconButton(
-                                            onClick = { playKodiOnPhone("${show.title} - ${ep.title}", ep.file) },
+                                            onClick = { playKodiOnPhone(ep.title, ep.file, episodeId = ep.episodeId) },
                                             modifier = Modifier.size(32.dp)
                                         ) {
                                             Icon(Icons.Rounded.PhoneAndroid, contentDescription = "تشغيل على الهاتف", tint = Accent, modifier = Modifier.size(18.dp))

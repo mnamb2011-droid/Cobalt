@@ -1,5 +1,7 @@
 package com.mnasser.cobaltremote
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -58,7 +60,7 @@ data class KodiEpisode(
 /**
  * Kodi JSON-RPC client for LG webOS (WebSocket/TCP port 9090, no auth required).
  * Supports Movies, TV Shows, Episodes, direct TV playback, Metahub/Cinemeta posters,
- * and UPnP/DLNA + HTTP VFS stream URL resolution for playing Kodi videos on the phone.
+ * and UPnP/DLNA ContentDirectory Browse + Search stream resolution for phone playback.
  */
 class KodiClient(
     private val host: String,
@@ -67,6 +69,7 @@ class KodiClient(
     private val reqIds = AtomicInteger(1)
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
     private val xmlMediaType = "text/xml; charset=utf-8".toMediaType()
+    @Volatile private var cachedContentDirControlUrl: String? = null
 
     private val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(4, TimeUnit.SECONDS)
@@ -333,21 +336,67 @@ class KodiClient(
     }
 
     /**
-     * Resolves an HTTP video stream URL to play a Kodi movie/episode directly on the Android phone:
-     * 1) Direct HTTP/HTTPS file path if already network-hosted.
-     * 2) Kodi UPnP / DLNA ContentDirectory server (works on LG webOS Kodi once "Share my libraries" is enabled!).
-     * 3) Kodi HTTP VFS (:8080/vfs/...) if HTTP server is enabled.
+     * Resolves an HTTP video stream URL for playing a Kodi movie/episode on the Android phone.
+     * Uses WifiManager.MulticastLock + scans all UPnP devices on TV IP to find Kodi ContentDirectory:1,
+     * then queries BrowseMetadata by Kodi's exact videodb:// ObjectID, with BrowseDirectChildren & Search fallbacks.
      */
-    suspend fun resolvePhoneStreamUrl(title: String, filePath: String): String? = withContext(Dispatchers.IO) {
+    suspend fun resolvePhoneStreamUrl(
+        context: Context,
+        title: String,
+        filePath: String,
+        movieId: Int? = null,
+        episodeId: Int? = null
+    ): String? = withContext(Dispatchers.IO) {
         val cleanPath = filePath.trim()
         if (cleanPath.startsWith("http://", true) || cleanPath.startsWith("https://", true)) {
             return@withContext cleanPath
         }
 
-        // Try UPnP/DLNA ContentDirectory on the TV IP (works on webOS Kodi without port 8080!)
-        findUpnpStreamUrl(title)?.let { return@withContext it }
+        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val lock = runCatching {
+            wifi?.createMulticastLock("kodi_upnp")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }.getOrNull()
 
-        // Fallback: check if Kodi HTTP VFS port 8080 is reachable
+        try {
+            val controlUrl = cachedContentDirControlUrl ?: discoverKodiContentDirectoryUrl()?.also {
+                cachedContentDirControlUrl = it
+            }
+            if (controlUrl != null) {
+                // 1. Direct BrowseMetadata using Kodi's exact Platinum UPnP ObjectIDs
+                val directIds = buildList {
+                    if (movieId != null) {
+                        add("videodb://movies/titles/$movieId")
+                    }
+                    if (episodeId != null) {
+                        add("videodb://tvshows/titles/-1/-1/$episodeId")
+                    }
+                }
+                for (objId in directIds) {
+                    upnpBrowse(controlUrl, objId, "BrowseMetadata", 1)?.let { xml ->
+                        extractFirstHttpRes(xml)?.let { return@withContext it }
+                    }
+                }
+
+                // 2. BrowseDirectChildren of movies container and match by title or filename
+                if (movieId != null) {
+                    upnpBrowse(controlUrl, "videodb://movies/titles/", "BrowseDirectChildren", 500)?.let { xml ->
+                        findMatchingItemRes(xml, title, cleanPath)?.let { return@withContext it }
+                    }
+                }
+
+                // 3. Fallback: UPnP Search by title
+                upnpSearch(controlUrl, title)?.let { xml ->
+                    extractFirstHttpRes(xml)?.let { return@withContext it }
+                }
+            }
+        } finally {
+            runCatching { if (lock?.isHeld == true) lock.release() }
+        }
+
+        // 4. Fallback: Kodi HTTP VFS (:8080/vfs/...) if HTTP server is enabled
         if (cleanPath.isNotEmpty()) {
             val vfsUrl = "http://$host:8080/vfs/${URLEncoder.encode(cleanPath, "UTF-8")}"
             val ok = runCatching {
@@ -359,10 +408,86 @@ class KodiClient(
         null
     }
 
-    private fun findUpnpStreamUrl(title: String): String? {
-        val location = discoverKodiUpnpLocation() ?: return null
-        val controlUrl = fetchContentDirectoryControlUrl(location) ?: return null
-        // Search ContentDirectory for the video title
+    private fun discoverKodiContentDirectoryUrl(): String? {
+        val locations = LinkedHashSet<String>()
+        val queries = listOf(
+            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:service:ContentDirectory:1\r\n\r\n",
+            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:device:MediaServer:1\r\n\r\n",
+            "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n"
+        )
+        runCatching {
+            DatagramSocket().use { socket ->
+                socket.soTimeout = 1800
+                val group = InetAddress.getByName("239.255.255.250")
+                queries.forEach { q ->
+                    val b = q.toByteArray()
+                    socket.send(DatagramPacket(b, b.size, group, 1900))
+                }
+                val buf = ByteArray(2048)
+                val deadline = System.currentTimeMillis() + 2600
+                while (System.currentTimeMillis() < deadline) {
+                    val packet = DatagramPacket(buf, buf.size)
+                    try {
+                        socket.receive(packet)
+                        val msg = String(packet.data, 0, packet.length)
+                        val loc = Regex("""(?im)^LOCATION:\s*(\S+)""").find(msg)?.groupValues?.getOrNull(1)?.trim()
+                        if (loc != null && (packet.address?.hostAddress == host || loc.contains(host))) {
+                            locations.add(loc)
+                        }
+                    } catch (_: Exception) {
+                        break
+                    }
+                }
+            }
+        }
+        // Inspect every UPnP device on the TV IP until we find Kodi's ContentDirectory:1 service
+        for (loc in locations) {
+            fetchContentDirectoryControlUrl(loc)?.let { return it }
+        }
+        return null
+    }
+
+    private fun fetchContentDirectoryControlUrl(locationUrl: String): String? = runCatching {
+        val xml = http.newCall(Request.Builder().url(locationUrl).build()).execute().use {
+            if (it.isSuccessful) it.body?.string() else null
+        } ?: return null
+        val serviceBlock = Regex(
+            """<service>[\s\S]*?ContentDirectory:1[\s\S]*?</service>""",
+            RegexOption.IGNORE_CASE
+        ).find(xml)?.value ?: return null
+        val rel = Regex("""<controlURL>([^<]+)</controlURL>""", RegexOption.IGNORE_CASE)
+            .find(serviceBlock)?.groupValues?.getOrNull(1)?.trim() ?: return null
+        URL(URL(locationUrl), rel).toString()
+    }.getOrNull()
+
+    private fun upnpBrowse(controlUrl: String, objectId: String, browseFlag: String, count: Int): String? {
+        val escapedId = objectId.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        val soap = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+              <s:Body>
+                <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+                  <ObjectID>$escapedId</ObjectID>
+                  <BrowseFlag>$browseFlag</BrowseFlag>
+                  <Filter>*</Filter>
+                  <StartingIndex>0</StartingIndex>
+                  <RequestedCount>$count</RequestedCount>
+                  <SortCriteria></SortCriteria>
+                </u:Browse>
+              </s:Body>
+            </s:Envelope>
+        """.trimIndent()
+        return runCatching {
+            val req = Request.Builder()
+                .url(controlUrl)
+                .header("SOAPACTION", "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"")
+                .post(soap.toRequestBody(xmlMediaType))
+                .build()
+            http.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
+        }.getOrNull()
+    }
+
+    private fun upnpSearch(controlUrl: String, title: String): String? {
         val escapedTitle = title.replace("\"", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         val soap = """
             <?xml version="1.0" encoding="utf-8"?>
@@ -379,62 +504,49 @@ class KodiClient(
               </s:Body>
             </s:Envelope>
         """.trimIndent()
-
-        val respXml = runCatching {
+        return runCatching {
             val req = Request.Builder()
                 .url(controlUrl)
                 .header("SOAPACTION", "\"urn:schemas-upnp-org:service:ContentDirectory:1#Search\"")
                 .post(soap.toRequestBody(xmlMediaType))
                 .build()
             http.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
-        }.getOrNull() ?: return null
-
-        val unescaped = respXml
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&amp;", "&")
-        val resRegex = Regex("""<res[^>]*>(https?://[^<]+)</res>""", RegexOption.IGNORE_CASE)
-        return resRegex.find(unescaped)?.groupValues?.getOrNull(1)?.trim()
+        }.getOrNull()
     }
 
-    private fun discoverKodiUpnpLocation(): String? = runCatching {
-        val query = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:service:ContentDirectory:1\r\n\r\n"
-        DatagramSocket().use { socket ->
-            socket.soTimeout = 2200
-            val bytes = query.toByteArray()
-            socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName("239.255.255.250"), 1900))
-            val buf = ByteArray(2048)
-            val deadline = System.currentTimeMillis() + 2500
-            while (System.currentTimeMillis() < deadline) {
-                val packet = DatagramPacket(buf, buf.size)
-                try {
-                    socket.receive(packet)
-                    val msg = String(packet.data, 0, packet.length)
-                    val loc = Regex("""(?im)^LOCATION:\s*(\S+)""").find(msg)?.groupValues?.getOrNull(1)
-                    if (loc != null && (packet.address?.hostAddress == host || loc.contains(host))) {
-                        return@use loc
-                    }
-                } catch (_: Exception) {
-                    break
-                }
-            }
-            null
-        }
-    }.getOrNull()
+    private fun unescapeDidl(xml: String): String = xml
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 
-    private fun fetchContentDirectoryControlUrl(locationUrl: String): String? = runCatching {
-        val xml = http.newCall(Request.Builder().url(locationUrl).build()).execute().use {
-            if (it.isSuccessful) it.body?.string() else null
-        } ?: return null
-        val serviceBlock = Regex(
-            """<service>[\s\S]*?ContentDirectory:1[\s\S]*?</service>""",
-            RegexOption.IGNORE_CASE
-        ).find(xml)?.value ?: return null
-        val rel = Regex("""<controlURL>([^<]+)</controlURL>""", RegexOption.IGNORE_CASE)
-            .find(serviceBlock)?.groupValues?.getOrNull(1)?.trim() ?: return null
-        val base = URL(locationUrl)
-        URL(base, rel).toString()
-    }.getOrNull()
+    private fun extractFirstHttpRes(rawXml: String): String? {
+        val didl = unescapeDidl(rawXml)
+        val resRegex = Regex("""<res[^>]*>(https?://[^<]+)</res>""", RegexOption.IGNORE_CASE)
+        return resRegex.findAll(didl)
+            .map { it.groupValues[1].trim() }
+            .firstOrNull { !it.endsWith(".jpg", true) && !it.endsWith(".png", true) && !it.endsWith(".srt", true) }
+            ?: resRegex.find(didl)?.groupValues?.getOrNull(1)?.trim()
+    }
+
+    private fun findMatchingItemRes(rawXml: String, title: String, filePath: String): String? {
+        val didl = unescapeDidl(rawXml)
+        val itemRegex = Regex("""<item\b[\s\S]*?</item>""", RegexOption.IGNORE_CASE)
+        val fileName = filePath.substringAfterLast('/').substringAfterLast('\\').substringBeforeLast('.')
+        val targetTitle = title.trim().lowercase()
+        for (m in itemRegex.findAll(didl)) {
+            val block = m.value
+            val itemTitle = Regex("""<dc:title>([^<]+)</dc:title>""", RegexOption.IGNORE_CASE)
+                .find(block)?.groupValues?.getOrNull(1)?.trim()?.lowercase().orEmpty()
+            if (itemTitle == targetTitle || (targetTitle.isNotEmpty() && itemTitle.contains(targetTitle)) ||
+                (fileName.length > 3 && block.contains(fileName, true))
+            ) {
+                extractFirstHttpRes(block)?.let { return it }
+            }
+        }
+        return null
+    }
 
     companion object {
         private val posterHttp = OkHttpClient.Builder()
