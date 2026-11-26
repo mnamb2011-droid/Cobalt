@@ -182,7 +182,8 @@ class WebOsClient(
             )
         )
         val manifest = JSONObject()
-            .put("appVersion", "1.4")
+            .put("appId", "com.mnasser.cobaltremote")
+            .put("appVersion", "1.1")
             .put("manifestVersion", 1)
             .put("permissions", permissions)
         val payload = JSONObject()
@@ -206,8 +207,8 @@ class WebOsClient(
             throw WebOsConnectionException(reply.optString("error", "تم رفض الاقتران على التلفزيون"))
         }
         if (reply.optString("type") == "registered") {
-            clientKey = reply.optJSONObject("payload")?.optString("client-key") ?: clientKey
-        } else if (clientKey.isNullOrBlank()) {
+            clientKey = reply.optJSONObject("payload")?.optString("client-key")?.takeIf { it.isNotBlank() } ?: clientKey
+        } else {
             clientKey = withTimeout(90000) { registered.await() }
         }
         if (clientKey.isNullOrBlank()) {

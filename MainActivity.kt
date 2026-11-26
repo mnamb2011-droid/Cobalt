@@ -118,16 +118,16 @@ class MainActivity : ComponentActivity() {
                     ) {
                         RemoteScreen(
                             savedIp = prefs.getString("tv_ip", "") ?: "",
-                            savedKey = secure.read("client_key"),
+                            savedKey = prefs.getString("client_key_v2", null) ?: secure.read("client_key"),
                             savedFingerprint = prefs.getString("tv_fingerprint", null),
                             savedKodiMoviesJson = prefs.getString("kodi_movies_cache", null),
                             savedKodiShowsJson = prefs.getString("kodi_shows_cache", null),
                             onSave = { ip, key, fp ->
                                 prefs.edit()
                                     .putString("tv_ip", ip)
+                                    .putString("client_key_v2", key)
                                     .putString("tv_fingerprint", fp)
-                                    .apply()
-                                secure.write("client_key", key)
+                                    .commit()
                             },
                             onCacheKodiMovies = { json ->
                                 prefs.edit().putString("kodi_movies_cache", json).apply()
@@ -137,7 +137,7 @@ class MainActivity : ComponentActivity() {
                             },
                             onClear = {
                                 secure.remove("client_key")
-                                prefs.edit().remove("tv_fingerprint").apply()
+                                prefs.edit().remove("client_key_v2").remove("tv_fingerprint").commit()
                             }
                         )
                     }
@@ -351,6 +351,14 @@ private fun RemoteScreen(
     var typed by remember { mutableStateOf("") }
     var lastSentText by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("جارٍ تهيئة الاتصال…") }
+    var transientNotice by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(transientNotice) {
+        if (transientNotice != null) {
+            delay(4000)
+            transientNotice = null
+        }
+    }
     var busy by remember { mutableStateOf(false) }
     var connected by remember { mutableStateOf(false) }
     var imeFocused by remember { mutableStateOf(false) }
@@ -480,7 +488,7 @@ private fun RemoteScreen(
             }
             runCatching { kodi.playMovie(movie.movieId, movie.file) }
                 .onSuccess {
-                    status = "يُعرض الآن: ${movie.title}"
+                    transientNotice = "تم إرسال الفيلم: ${movie.title}"
                     kodiStatus = "تم تشغيل الفيلم: ${movie.title}"
                 }
                 .onFailure { kodiStatus = "تعذر تشغيل الفيلم: ${it.message}" }
@@ -521,7 +529,7 @@ private fun RemoteScreen(
             }
             runCatching { kodi.playEpisode(ep.episodeId, ep.file) }
                 .onSuccess {
-                    status = "يُعرض الآن: $showTitle (م${ep.season} ح${ep.episode})"
+                    transientNotice = "تم إرسال الحلقة: $showTitle (م${ep.season} ح${ep.episode})"
                     kodiStatus = "تم تشغيل الحلقة ${ep.episode} من $showTitle"
                     selectedShow = null
                 }
@@ -668,7 +676,7 @@ private fun RemoteScreen(
             val fg = c.getForegroundAppId()
             val ytId = resolveYouTubeAppId(fg)
             c.playYouTubeVideo(ytId, videoId)
-            status = if (title != null) "جارٍ التشغيل: $title" else "تم إرسال الفيديو إلى كوبالت"
+            transientNotice = if (title != null) "تم التشغيل: $title" else "تم إرسال الفيديو إلى كوبالت"
         }
     }
 
@@ -756,7 +764,7 @@ private fun RemoteScreen(
                     )
                 }
                 Text(
-                    text = status,
+                    text = transientNotice ?: if (connected) "متصل • $ip" else status,
                     color = if (connected) Accent else TextMuted,
                     fontSize = 11.sp,
                     maxLines = 1,
@@ -962,8 +970,9 @@ private fun RemoteScreen(
                             }
                         }
 
-                        Column(verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                            SideNavButton(Icons.Rounded.Home, "الرئيسية") { command { it.button("HOME") } }
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            SideNavButton(Icons.Rounded.Home, "الرئيسية") { transientNotice = null; command { it.button("HOME") } }
+                            SideNavButton(Icons.Rounded.Input, "الإدخالات") { transientNotice = null; command { it.button("INPUT_HUB") } }
                             SideNavButton(Icons.Rounded.Menu, "القائمة") { command { it.button("MENU") } }
                         }
                     }
@@ -1406,7 +1415,8 @@ private fun RemoteScreen(
             }
         }
 
-        // 5. Smart Keyboard & YouTube Search Dock
+        // 5. Smart Keyboard & YouTube Search Dock (Remote tab ONLY)
+        if (activeTab == RemoteTab.REMOTE) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1486,6 +1496,7 @@ private fun RemoteScreen(
                     modifier = Modifier.size(21.dp)
                 )
             }
+        }
         }
     }
 
