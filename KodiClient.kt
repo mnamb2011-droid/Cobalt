@@ -10,8 +10,12 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
@@ -53,7 +57,8 @@ data class KodiEpisode(
 
 /**
  * Kodi JSON-RPC client for LG webOS (WebSocket/TCP port 9090, no auth required).
- * Supports Movies, TV Shows, Episodes, direct playback, and Metahub/Cinemeta poster resolution.
+ * Supports Movies, TV Shows, Episodes, direct TV playback, Metahub/Cinemeta posters,
+ * and UPnP/DLNA + HTTP VFS stream URL resolution for playing Kodi videos on the phone.
  */
 class KodiClient(
     private val host: String,
@@ -61,6 +66,7 @@ class KodiClient(
 ) {
     private val reqIds = AtomicInteger(1)
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+    private val xmlMediaType = "text/xml; charset=utf-8".toMediaType()
 
     private val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(4, TimeUnit.SECONDS)
@@ -205,7 +211,6 @@ class KodiClient(
                 return decoded.replace("/t/p/original/", "/t/p/w342/")
             }
         }
-        // Instant zero-API-key poster URL from IMDb ID via Metahub/Cinemeta CDN
         if (!imdbId.isNullOrBlank() && imdbId.startsWith("tt")) {
             return "https://images.metahub.space/poster/medium/$imdbId/img"
         }
@@ -287,12 +292,7 @@ class KodiClient(
         val params = JSONObject()
             .put("tvshowid", tvshowId)
             .put("properties", JSONArray(listOf("title", "season", "episode", "runtime", "playcount", "file")))
-            .put(
-                "sort",
-                JSONObject()
-                    .put("order", "ascending")
-                    .put("method", "episode")
-            )
+            .put("sort", JSONObject().put("order", "ascending").put("method", "episode"))
         val result = call("VideoLibrary.GetEpisodes", params).optJSONObject("result") ?: return emptyList()
         val arr = result.optJSONArray("episodes") ?: return emptyList()
         return (0 until arr.length()).mapNotNull { i ->
@@ -332,13 +332,116 @@ class KodiClient(
         }
     }
 
+    /**
+     * Resolves an HTTP video stream URL to play a Kodi movie/episode directly on the Android phone:
+     * 1) Direct HTTP/HTTPS file path if already network-hosted.
+     * 2) Kodi UPnP / DLNA ContentDirectory server (works on LG webOS Kodi once "Share my libraries" is enabled!).
+     * 3) Kodi HTTP VFS (:8080/vfs/...) if HTTP server is enabled.
+     */
+    suspend fun resolvePhoneStreamUrl(title: String, filePath: String): String? = withContext(Dispatchers.IO) {
+        val cleanPath = filePath.trim()
+        if (cleanPath.startsWith("http://", true) || cleanPath.startsWith("https://", true)) {
+            return@withContext cleanPath
+        }
+
+        // Try UPnP/DLNA ContentDirectory on the TV IP (works on webOS Kodi without port 8080!)
+        findUpnpStreamUrl(title)?.let { return@withContext it }
+
+        // Fallback: check if Kodi HTTP VFS port 8080 is reachable
+        if (cleanPath.isNotEmpty()) {
+            val vfsUrl = "http://$host:8080/vfs/${URLEncoder.encode(cleanPath, "UTF-8")}"
+            val ok = runCatching {
+                val req = Request.Builder().url(vfsUrl).head().build()
+                http.newCall(req).execute().use { it.isSuccessful }
+            }.getOrDefault(false)
+            if (ok) return@withContext vfsUrl
+        }
+        null
+    }
+
+    private fun findUpnpStreamUrl(title: String): String? {
+        val location = discoverKodiUpnpLocation() ?: return null
+        val controlUrl = fetchContentDirectoryControlUrl(location) ?: return null
+        // Search ContentDirectory for the video title
+        val escapedTitle = title.replace("\"", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        val soap = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+              <s:Body>
+                <u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+                  <ContainerID>0</ContainerID>
+                  <SearchCriteria>dc:title contains "$escapedTitle"</SearchCriteria>
+                  <Filter>*</Filter>
+                  <StartingIndex>0</StartingIndex>
+                  <RequestedCount>5</RequestedCount>
+                  <SortCriteria></SortCriteria>
+                </u:Search>
+              </s:Body>
+            </s:Envelope>
+        """.trimIndent()
+
+        val respXml = runCatching {
+            val req = Request.Builder()
+                .url(controlUrl)
+                .header("SOAPACTION", "\"urn:schemas-upnp-org:service:ContentDirectory:1#Search\"")
+                .post(soap.toRequestBody(xmlMediaType))
+                .build()
+            http.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
+        }.getOrNull() ?: return null
+
+        val unescaped = respXml
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+        val resRegex = Regex("""<res[^>]*>(https?://[^<]+)</res>""", RegexOption.IGNORE_CASE)
+        return resRegex.find(unescaped)?.groupValues?.getOrNull(1)?.trim()
+    }
+
+    private fun discoverKodiUpnpLocation(): String? = runCatching {
+        val query = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:service:ContentDirectory:1\r\n\r\n"
+        DatagramSocket().use { socket ->
+            socket.soTimeout = 2200
+            val bytes = query.toByteArray()
+            socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName("239.255.255.250"), 1900))
+            val buf = ByteArray(2048)
+            val deadline = System.currentTimeMillis() + 2500
+            while (System.currentTimeMillis() < deadline) {
+                val packet = DatagramPacket(buf, buf.size)
+                try {
+                    socket.receive(packet)
+                    val msg = String(packet.data, 0, packet.length)
+                    val loc = Regex("""(?im)^LOCATION:\s*(\S+)""").find(msg)?.groupValues?.getOrNull(1)
+                    if (loc != null && (packet.address?.hostAddress == host || loc.contains(host))) {
+                        return@use loc
+                    }
+                } catch (_: Exception) {
+                    break
+                }
+            }
+            null
+        }
+    }.getOrNull()
+
+    private fun fetchContentDirectoryControlUrl(locationUrl: String): String? = runCatching {
+        val xml = http.newCall(Request.Builder().url(locationUrl).build()).execute().use {
+            if (it.isSuccessful) it.body?.string() else null
+        } ?: return null
+        val serviceBlock = Regex(
+            """<service>[\s\S]*?ContentDirectory:1[\s\S]*?</service>""",
+            RegexOption.IGNORE_CASE
+        ).find(xml)?.value ?: return null
+        val rel = Regex("""<controlURL>([^<]+)</controlURL>""", RegexOption.IGNORE_CASE)
+            .find(serviceBlock)?.groupValues?.getOrNull(1)?.trim() ?: return null
+        val base = URL(locationUrl)
+        URL(base, rel).toString()
+    }.getOrNull()
+
     companion object {
         private val posterHttp = OkHttpClient.Builder()
             .connectTimeout(6, TimeUnit.SECONDS)
             .readTimeout(6, TimeUnit.SECONDS)
             .build()
 
-        /** Fallback poster lookup by title via public Cinemeta catalog when IMDb ID is absent. */
         suspend fun searchPosterByTitle(title: String, isSeries: Boolean): String? = withContext(Dispatchers.IO) {
             val clean = title.trim()
             if (clean.isEmpty()) return@withContext null
