@@ -263,6 +263,8 @@ internal fun ScenarioTabContent(
     onAddStep: (ScenarioStep) -> Unit,
     onRemoveStep: (String) -> Unit,
     onMoveStep: (Int, Int) -> Unit,
+    showTvTimer: Boolean,
+    onToggleTvTimer: (Boolean) -> Unit,
     onResetStepProgress: (String) -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
@@ -323,6 +325,22 @@ internal fun ScenarioTabContent(
                     color = TabAccent,
                     trackColor = TabBorder
                 )
+                val nextStep = steps.getOrNull(currentStepIndex + 1)
+                if (nextStep != null) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(TabInk)
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(Icons.Rounded.SkipNext, contentDescription = null, tint = TabWarning, modifier = Modifier.size(16.dp))
+                        Text("التالي:", color = TabWarning, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(nextStep.title, color = TabText, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    }
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilledTonalButton(
                         onClick = onSkipNext,
@@ -372,6 +390,24 @@ internal fun ScenarioTabContent(
                     Text("إضافة خطوة", fontSize = 12.sp)
                 }
             }
+        }
+
+        // Toggle for sleek top-corner TV screen timer & "Next Up" notification
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(TabCard)
+                .border(1.dp, TabBorder, RoundedCornerShape(12.dp))
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.weight(1f)) {
+                Icon(Icons.Rounded.Timer, contentDescription = null, tint = TabAccent, modifier = Modifier.size(18.dp))
+                Text("عرض التايمر و«التالي» في ركن شاشة التلفزيون", color = TabText, fontSize = 11.sp)
+            }
+            Switch(checked = showTvTimer, onCheckedChange = onToggleTvTimer)
         }
 
         // Steps List

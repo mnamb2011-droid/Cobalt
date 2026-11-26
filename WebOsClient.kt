@@ -330,7 +330,7 @@ class WebOsClient(
     /** Launches a specific YouTube video directly in Cobalt YouTube via verified contentTarget. */
     suspend fun playYouTubeVideo(appId: String, videoId: String, startAtSec: Int = 0) {
         val contentTarget = if (startAtSec > 0) {
-            "https://www.youtube.com/watch?v=$videoId&t=${startAtSec}s"
+            "https://www.youtube.com/watch?v=$videoId&t=$startAtSec"
         } else {
             "https://www.youtube.com/watch?v=$videoId"
         }
@@ -432,6 +432,13 @@ class WebOsClient(
 
     suspend fun setVolume(volume: Int) {
         request("audio/setVolume", JSONObject().put("volume", volume.coerceIn(0, 100)))
+    }
+
+    suspend fun showToast(message: String) {
+        if (message.isBlank()) return
+        runCatching {
+            request("system.notifications/createToast", JSONObject().put("message", message))
+        }
     }
 
     suspend fun powerOff() {

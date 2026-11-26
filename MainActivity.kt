@@ -418,6 +418,7 @@ private fun RemoteScreen(
     var scenarioRemainingSec by remember { mutableIntStateOf(0) }
     var scenarioCurrentTotalSec by remember { mutableIntStateOf(1) }
     var scenarioStepElapsedSec by remember { mutableIntStateOf(0) }
+    var showTvTimer by remember { mutableStateOf(true) }
     var scenarioJob by remember { mutableStateOf<Job?>(null) }
     var scenarioSkipSignal by remember { mutableStateOf<CompletableDeferred<Unit>?>(null) }
     var streamUrl by remember { mutableStateOf(savedStreamUrl) }
@@ -586,7 +587,7 @@ private fun RemoteScreen(
         }
     }
 
-    fun playKodiOnPhone(title: String, filePath: String, movieId: Int? = null, episodeId: Int? = null) {
+    fun playKodiOnPhone(title: String, originalTitle: String, filePath: String, movieId: Int? = null, episodeId: Int? = null) {
         val kodi = kodiClient ?: run {
             kodiStatus = "اتصل بالتلفزيون أولاً"
             return
@@ -600,7 +601,7 @@ private fun RemoteScreen(
                 kodiStatus = "تعذر الاتصال بكودي لتشغيل الفيديو على الهاتف"
                 return@launch
             }
-            val res = kodi.resolvePhoneStreamUrl(context, title, filePath, movieId, episodeId)
+            val res = kodi.resolvePhoneStreamUrl(context, title, originalTitle, filePath, movieId, episodeId)
             kodiLoading = false
             val url = res.url
             if (url != null) {
@@ -621,12 +622,14 @@ private fun RemoteScreen(
         }
     }
 
-    fun saveStepResumeBookmark(stepId: String, watchedSec: Int) {
-        if (watchedSec <= 0) return
+    fun saveStepResumeBookmark(step: ScenarioStep, watchedSec: Int, exactPosSec: Int? = null) {
+        if (watchedSec <= 0 && exactPosSec == null) return
+        if (!step.autoResume) return
+        if (step.type != ScenarioActionType.YOUTUBE && step.type != ScenarioActionType.KODI_MOVIE) return
+        val nextPos = exactPosSec?.takeIf { it > 0 } ?: (step.startAtSec + watchedSec)
+        val finalPos = if (step.videoDurationSec > 0 && nextPos >= step.videoDurationSec - 10) 0 else nextPos
         val updated = scenarioSteps.map { s ->
-            if (s.id == stepId && s.autoResume && (s.type == ScenarioActionType.YOUTUBE || s.type == ScenarioActionType.KODI_MOVIE)) {
-                val nextPos = s.startAtSec + watchedSec
-                val finalPos = if (s.videoDurationSec > 0 && nextPos >= s.videoDurationSec - 10) 0 else nextPos
+            if ((s.id == step.id || (s.type == step.type && s.target == step.target)) && s.autoResume) {
                 s.copy(startAtSec = finalPos)
             } else s
         }
@@ -637,7 +640,7 @@ private fun RemoteScreen(
     fun stopScenario() {
         val currentStep = scenarioSteps.getOrNull(scenarioStepIdx)
         if (currentStep != null && scenarioStepElapsedSec > 5) {
-            saveStepResumeBookmark(currentStep.id, scenarioStepElapsedSec)
+            saveStepResumeBookmark(currentStep, scenarioStepElapsedSec)
         }
         scenarioJob?.cancel()
         scenarioJob = null
@@ -701,6 +704,13 @@ private fun RemoteScreen(
                 }
                 scenarioCurrentTotalSec = totalSec
 
+                val nextStepTitle = stepsSnapshot.getOrNull(idx + 1)?.title
+                val nextSuffix = if (nextStepTitle != null) "  |  التالي: $nextStepTitle" else "  |  الخطوة الأخيرة"
+                if (showTvTimer && tv != null) {
+                    val startLabel = if (step.startAtSec > 0) " (من ${ScenarioStore.formatTimestamp(step.startAtSec)})" else ""
+                    tv.showToast("▶ ${step.title}$startLabel  •  ⏱ ${ScenarioStore.formatTimestamp(totalSec)}$nextSuffix")
+                }
+
                 val skipDef = CompletableDeferred<Unit>()
                 scenarioSkipSignal = skipDef
                 var left = totalSec
@@ -708,13 +718,19 @@ private fun RemoteScreen(
                 while (left > 0 && !skipDef.isCompleted) {
                     scenarioRemainingSec = left
                     scenarioStepElapsedSec = elapsed
+                    if (showTvTimer && tv != null && elapsed > 0 && (left == 15 || left == 60 || left == 120 || (left > 120 && left % 300 == 0))) {
+                        tv.showToast("⏱ متبقي ${ScenarioStore.formatTimestamp(left)}$nextSuffix")
+                    }
                     val waited = withTimeoutOrNull(1000) { skipDef.await(); true }
                     if (waited == true) break
                     left--
                     elapsed++
                 }
                 if (elapsed > 5) {
-                    saveStepResumeBookmark(step.id, elapsed)
+                    val exactKodiPos = if (step.type == ScenarioActionType.KODI_MOVIE) {
+                        kodiClient?.getCurrentPlayTimeSec()
+                    } else null
+                    saveStepResumeBookmark(step, elapsed, exactKodiPos)
                 }
             }
             scenarioRunning = false
@@ -1069,6 +1085,40 @@ private fun RemoteScreen(
                         Text("مسح الاقتران", color = Danger, fontSize = 11.sp)
                     }
                 }
+            }
+        }
+
+        // Sleek Top-Corner Live Scenario Timer & "Next Up" Banner (visible on Remote/Kodi/Apps tabs too!)
+        if (scenarioRunning && activeTab != RemoteTab.SCENARIO && scenarioStepIdx in scenarioSteps.indices) {
+            val activeStep = scenarioSteps[scenarioStepIdx]
+            val nextStep = scenarioSteps.getOrNull(scenarioStepIdx + 1)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Brush.horizontalGradient(listOf(SurfaceElevated, SurfaceCard)))
+                    .border(1.dp, Accent.copy(alpha = 0.7f), RoundedCornerShape(14.dp))
+                    .clickable { activeTab = RemoteTab.SCENARIO }
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Surface(color = Accent.copy(alpha = 0.18f), shape = RoundedCornerShape(8.dp)) {
+                    Text(
+                        text = "⏱ ${ScenarioStore.formatTimestamp(scenarioRemainingSec)}",
+                        color = Accent,
+                        fontWeight = FontWeight.Black,
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(activeStep.title, color = TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (nextStep != null) {
+                        Text("التالي: ${nextStep.title}", color = Warning, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                Icon(Icons.Rounded.SkipNext, contentDescription = "تخطي", tint = Accent, modifier = Modifier.size(20.dp).clickable { scenarioSkipSignal?.complete(Unit) })
             }
         }
 
@@ -1459,7 +1509,7 @@ private fun RemoteScreen(
                                         initialPosterUrl = movie.posterUrl,
                                         topBadge = metaBadge,
                                         onClick = { playKodiMovieDirectly(movie) },
-                                        onPlayOnPhone = { playKodiOnPhone(movie.title, movie.file, movieId = movie.movieId) }
+                                        onPlayOnPhone = { playKodiOnPhone(movie.title, movie.originalTitle, movie.file, movieId = movie.movieId) }
                                     )
                                 }
                             }
@@ -1535,6 +1585,8 @@ private fun RemoteScreen(
                             onSaveScenario(ScenarioStore.serialize(scenarioSteps))
                         }
                     },
+                    showTvTimer = showTvTimer,
+                    onToggleTvTimer = { showTvTimer = it },
                     onResetStepProgress = { id ->
                         scenarioSteps = scenarioSteps.map { if (it.id == id) it.copy(startAtSec = 0) else it }
                         onSaveScenario(ScenarioStore.serialize(scenarioSteps))
@@ -1977,7 +2029,7 @@ private fun RemoteScreen(
                                             Icon(Icons.Rounded.CheckCircle, contentDescription = "تمت المشاهدة", tint = Accent.copy(alpha = 0.8f), modifier = Modifier.size(18.dp))
                                         }
                                         IconButton(
-                                            onClick = { playKodiOnPhone(ep.title, ep.file, episodeId = ep.episodeId) },
+                                            onClick = { playKodiOnPhone(ep.title, show.originalTitle, ep.file, episodeId = ep.episodeId) },
                                             modifier = Modifier.size(32.dp)
                                         ) {
                                             Icon(Icons.Rounded.PhoneAndroid, contentDescription = "تشغيل على الهاتف", tint = Accent, modifier = Modifier.size(18.dp))
