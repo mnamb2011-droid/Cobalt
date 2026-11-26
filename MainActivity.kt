@@ -1,6 +1,9 @@
 package com.mnasser.cobaltremote
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.view.WindowManager
 import android.net.ConnectivityManager
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -85,7 +88,7 @@ private val Warning = Color(0xFFFFC861)
 private val TextPrimary = Color(0xFFF3F6FB)
 private val TextMuted = Color(0xFF94A3B8)
 
-private enum class RemoteTab { REMOTE, KODI, APPS }
+private enum class RemoteTab { REMOTE, KODI, SCENARIO, STREAM, APPS }
 private enum class KodiSection { MOVIES, SERIES }
 
 class MainActivity : ComponentActivity() {
@@ -122,6 +125,8 @@ class MainActivity : ComponentActivity() {
                             savedFingerprint = prefs.getString("tv_fingerprint", null),
                             savedKodiMoviesJson = prefs.getString("kodi_movies_cache", null),
                             savedKodiShowsJson = prefs.getString("kodi_shows_cache", null),
+                            savedScenarioJson = prefs.getString("scenario_steps_json", null),
+                            savedStreamUrl = prefs.getString("stream_url", "") ?: "",
                             onSave = { ip, key, fp ->
                                 prefs.edit()
                                     .putString("tv_ip", ip)
@@ -134,6 +139,12 @@ class MainActivity : ComponentActivity() {
                             },
                             onCacheKodiShows = { json ->
                                 prefs.edit().putString("kodi_shows_cache", json).apply()
+                            },
+                            onSaveScenario = { json ->
+                                prefs.edit().putString("scenario_steps_json", json).apply()
+                            },
+                            onSaveStreamUrl = { url ->
+                                prefs.edit().putString("stream_url", url).apply()
                             },
                             onClear = {
                                 secure.remove("client_key")
@@ -337,9 +348,13 @@ private fun RemoteScreen(
     savedFingerprint: String?,
     savedKodiMoviesJson: String?,
     savedKodiShowsJson: String?,
+    savedScenarioJson: String?,
+    savedStreamUrl: String,
     onSave: (String, String, String?) -> Unit,
     onCacheKodiMovies: (String) -> Unit,
     onCacheKodiShows: (String) -> Unit,
+    onSaveScenario: (String) -> Unit,
+    onSaveStreamUrl: (String) -> Unit,
     onClear: () -> Unit
 ) {
     val context = LocalContext.current
@@ -395,6 +410,27 @@ private fun RemoteScreen(
     var showEpisodes by remember { mutableStateOf<List<KodiEpisode>>(emptyList()) }
     var episodesLoading by remember { mutableStateOf(false) }
     var selectedSeason by remember { mutableIntStateOf(-1) }
+
+    // Scenario Orchestrator & Stream State
+    var scenarioSteps by remember { mutableStateOf(ScenarioStore.deserialize(savedScenarioJson)) }
+    var scenarioRunning by remember { mutableStateOf(false) }
+    var scenarioStepIdx by remember { mutableIntStateOf(0) }
+    var scenarioRemainingSec by remember { mutableIntStateOf(0) }
+    var scenarioJob by remember { mutableStateOf<Job?>(null) }
+    var scenarioSkipSignal by remember { mutableStateOf<CompletableDeferred<Unit>?>(null) }
+    var streamUrl by remember { mutableStateOf(savedStreamUrl) }
+
+    DisposableEffect(scenarioRunning) {
+        val act = context as? ComponentActivity
+        if (scenarioRunning) {
+            act?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            act?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            act?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
 
     // YouTube Search Dialog State
     var showYtDialog by remember { mutableStateOf(false) }
@@ -545,6 +581,113 @@ private fun RemoteScreen(
                     selectedShow = null
                 }
                 .onFailure { kodiStatus = "تعذر تشغيل الحلقة: ${it.message}" }
+        }
+    }
+
+    fun playKodiOnPhone(title: String, filePath: String) {
+        val kodi = kodiClient ?: run {
+            kodiStatus = "اتصل بالتلفزيون أولاً"
+            return
+        }
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        scope.launch {
+            kodiLoading = true
+            kodiStatus = "جارٍ تجهيز بث «$title» على الهاتف…"
+            if (!ensureKodiReady(kodi)) {
+                kodiLoading = false
+                kodiStatus = "تعذر الاتصال بكودي لتشغيل الفيديو على الهاتف"
+                return@launch
+            }
+            val url = kodi.resolvePhoneStreamUrl(title, filePath)
+            kodiLoading = false
+            if (url != null) {
+                streamUrl = url
+                onSaveStreamUrl(url)
+                kodiStatus = "تم فتح «$title» على الهاتف"
+                runCatching {
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(Uri.parse(url), "video/*")
+                    }
+                    context.startActivity(Intent.createChooser(intent, "تشغيل «$title» على الهاتف"))
+                }.onFailure {
+                    activeTab = RemoteTab.STREAM
+                }
+            } else {
+                kodiStatus = "لتشغيل أفلام كودي على الهاتف فعّل في كودي: الإعدادات ← الخدمات ← UPnP / DLNA ← مشاركة مكتباتي"
+            }
+        }
+    }
+
+    fun stopScenario() {
+        scenarioJob?.cancel()
+        scenarioJob = null
+        scenarioSkipSignal = null
+        scenarioRunning = false
+        scenarioRemainingSec = 0
+        transientNotice = "تم إيقاف السيناريو"
+    }
+
+    fun startScenario() {
+        if (scenarioSteps.isEmpty()) return
+        scenarioJob?.cancel()
+        scenarioRunning = true
+        scenarioJob = scope.launch {
+            val stepsSnapshot = scenarioSteps.toList()
+            for (idx in stepsSnapshot.indices) {
+                val step = stepsSnapshot[idx]
+                scenarioStepIdx = idx
+                transientNotice = "سيناريو (${idx + 1}/${stepsSnapshot.size}): ${step.title}"
+
+                // Execute step action on LG TV
+                val tv = client
+                if (tv != null) {
+                    runCatching {
+                        when (step.type) {
+                            ScenarioActionType.YOUTUBE -> {
+                                val ytId = resolveYouTubeAppId(tv.getForegroundAppId())
+                                tv.playYouTubeVideo(ytId, step.target)
+                            }
+                            ScenarioActionType.KODI_MOVIE -> {
+                                val kodi = kodiClient
+                                val movieId = step.target.toIntOrNull()
+                                if (kodi != null && movieId != null && ensureKodiReady(kodi)) {
+                                    kodi.playMovie(movieId, step.extra)
+                                }
+                            }
+                            ScenarioActionType.HDMI -> {
+                                if (step.target == "LIVE_TV") {
+                                    tv.launchApp("com.webos.app.livetv")
+                                } else {
+                                    tv.switchInput(TvInput(step.target, step.title, step.extra.ifBlank { null }, true))
+                                }
+                            }
+                            ScenarioActionType.TV_APP -> {
+                                tv.launchApp(step.target)
+                            }
+                            ScenarioActionType.POWER_OFF -> {
+                                tv.powerOff()
+                            }
+                        }
+                    }
+                }
+
+                if (step.type == ScenarioActionType.POWER_OFF) break
+
+                val totalSec = (step.durationMinutes * 60).coerceAtLeast(1)
+                val skipDef = CompletableDeferred<Unit>()
+                scenarioSkipSignal = skipDef
+                var left = totalSec
+                while (left > 0 && !skipDef.isCompleted) {
+                    scenarioRemainingSec = left
+                    val waited = withTimeoutOrNull(1000) { skipDef.await(); true }
+                    if (waited == true) break
+                    left--
+                }
+            }
+            scenarioRunning = false
+            scenarioRemainingSec = 0
+            scenarioSkipSignal = null
+            transientNotice = "انتهى تنفيذ السيناريو بنجاح"
         }
     }
 
@@ -895,43 +1038,35 @@ private fun RemoteScreen(
             }
         }
 
-        // 3. 3-Tab Mode Switcher (Remote | Kodi | TV Apps)
+        // 3. 5-Tab Mode Switcher (Remote | Kodi | Scenario | Stream | Apps)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(14.dp))
                 .background(SurfaceCard)
                 .padding(4.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
+            horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            TabPill(
-                label = "الريموت",
-                icon = Icons.Rounded.SettingsRemote,
-                selected = activeTab == RemoteTab.REMOTE,
-                accentColor = Accent,
-                modifier = Modifier.weight(1f)
-            ) { activeTab = RemoteTab.REMOTE }
-
-            TabPill(
-                label = "كودي",
-                icon = Icons.Rounded.LocalMovies,
-                selected = activeTab == RemoteTab.KODI,
-                accentColor = KodiBlue,
-                modifier = Modifier.weight(1f)
-            ) {
+            CompactNavTab("الريموت", Icons.Rounded.SettingsRemote, activeTab == RemoteTab.REMOTE, Accent, Modifier.weight(1f)) {
+                activeTab = RemoteTab.REMOTE
+            }
+            CompactNavTab("كودي", Icons.Rounded.LocalMovies, activeTab == RemoteTab.KODI, KodiBlue, Modifier.weight(1f)) {
                 activeTab = RemoteTab.KODI
                 if (kodiMovies.isEmpty() && kodiShows.isEmpty() && !kodiLoading && ip.isNotBlank()) {
                     refreshKodiLibrary(autoLaunch = false)
                 }
             }
-
-            TabPill(
-                label = "التطبيقات",
-                icon = Icons.Rounded.Apps,
-                selected = activeTab == RemoteTab.APPS,
-                accentColor = Accent,
+            CompactNavTab(
+                label = if (scenarioRunning) "يعمل…" else "سيناريو",
+                icon = Icons.Rounded.Schedule,
+                selected = activeTab == RemoteTab.SCENARIO,
+                accentColor = if (scenarioRunning) Warning else Accent,
                 modifier = Modifier.weight(1f)
-            ) {
+            ) { activeTab = RemoteTab.SCENARIO }
+            CompactNavTab("البث", Icons.Rounded.Cast, activeTab == RemoteTab.STREAM, Accent, Modifier.weight(1f)) {
+                activeTab = RemoteTab.STREAM
+            }
+            CompactNavTab("التطبيقات", Icons.Rounded.Apps, activeTab == RemoteTab.APPS, Accent, Modifier.weight(1f)) {
                 activeTab = RemoteTab.APPS
                 if (apps.isEmpty() && connected) command(false) { apps = it.getApps() }
             }
@@ -1289,7 +1424,8 @@ private fun RemoteScreen(
                                         isSeries = false,
                                         initialPosterUrl = movie.posterUrl,
                                         topBadge = metaBadge,
-                                        onClick = { playKodiMovieDirectly(movie) }
+                                        onClick = { playKodiMovieDirectly(movie) },
+                                        onPlayOnPhone = { playKodiOnPhone(movie.title, movie.file) }
                                     )
                                 }
                             }
@@ -1336,6 +1472,52 @@ private fun RemoteScreen(
                         }
                     }
                 }
+            }
+
+            RemoteTab.SCENARIO -> {
+                ScenarioTabContent(
+                    steps = scenarioSteps,
+                    running = scenarioRunning,
+                    currentStepIndex = scenarioStepIdx,
+                    remainingSec = scenarioRemainingSec,
+                    kodiMovies = kodiMovies,
+                    tvInputs = tvInputs,
+                    tvApps = apps,
+                    onAddStep = { step ->
+                        scenarioSteps = scenarioSteps + step
+                        onSaveScenario(ScenarioStore.serialize(scenarioSteps))
+                    },
+                    onRemoveStep = { id ->
+                        scenarioSteps = scenarioSteps.filterNot { it.id == id }
+                        onSaveScenario(ScenarioStore.serialize(scenarioSteps))
+                    },
+                    onMoveStep = { from, to ->
+                        if (from in scenarioSteps.indices && to in scenarioSteps.indices) {
+                            val list = scenarioSteps.toMutableList()
+                            val item = list.removeAt(from)
+                            list.add(to, item)
+                            scenarioSteps = list
+                            onSaveScenario(ScenarioStore.serialize(scenarioSteps))
+                        }
+                    },
+                    onStart = { startScenario() },
+                    onStop = { stopScenario() },
+                    onSkipNext = { scenarioSkipSignal?.complete(Unit) },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            RemoteTab.STREAM -> {
+                StreamTabContent(
+                    tvIp = ip,
+                    streamUrl = streamUrl,
+                    onStreamUrlChange = { url ->
+                        streamUrl = url
+                        onSaveStreamUrl(url)
+                    },
+                    onRemoteCommand = { block -> command { block(it) } },
+                    modifier = Modifier.weight(1f)
+                )
             }
 
             RemoteTab.APPS -> {
@@ -1755,7 +1937,13 @@ private fun RemoteScreen(
                                         if (ep.playcount > 0) {
                                             Icon(Icons.Rounded.CheckCircle, contentDescription = "تمت المشاهدة", tint = Accent.copy(alpha = 0.8f), modifier = Modifier.size(18.dp))
                                         }
-                                        Icon(Icons.Rounded.PlayArrow, contentDescription = "تشغيل", tint = KodiBlue, modifier = Modifier.size(22.dp))
+                                        IconButton(
+                                            onClick = { playKodiOnPhone("${show.title} - ${ep.title}", ep.file) },
+                                            modifier = Modifier.size(32.dp)
+                                        ) {
+                                            Icon(Icons.Rounded.PhoneAndroid, contentDescription = "تشغيل على الهاتف", tint = Accent, modifier = Modifier.size(18.dp))
+                                        }
+                                        Icon(Icons.Rounded.PlayArrow, contentDescription = "تشغيل على التلفزيون", tint = KodiBlue, modifier = Modifier.size(22.dp))
                                     }
                                 }
                             }
@@ -1914,7 +2102,8 @@ private fun KodiPosterCard(
     isSeries: Boolean,
     initialPosterUrl: String?,
     topBadge: String,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onPlayOnPhone: (() -> Unit)? = null
 ) {
     var resolvedPoster by remember(initialPosterUrl, fallbackQuery) { mutableStateOf(initialPosterUrl) }
 
@@ -1980,10 +2169,30 @@ private fun KodiPosterCard(
             ) {
                 Icon(
                     imageVector = if (isSeries) Icons.Rounded.PlaylistPlay else Icons.Rounded.PlayArrow,
-                    contentDescription = if (isSeries) "الحلقات" else "تشغيل",
+                    contentDescription = if (isSeries) "الحلقات" else "تشغيل على التلفزيون",
                     tint = Ink,
                     modifier = Modifier.size(17.dp)
                 )
+            }
+            if (onPlayOnPhone != null) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(5.dp)
+                        .size(26.dp)
+                        .clip(CircleShape)
+                        .background(Ink.copy(alpha = 0.85f))
+                        .border(1.dp, Accent.copy(alpha = 0.7f), CircleShape)
+                        .clickable(onClick = onPlayOnPhone),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.PhoneAndroid,
+                        contentDescription = "تشغيل على الهاتف",
+                        tint = Accent,
+                        modifier = Modifier.size(15.dp)
+                    )
+                }
             }
         }
         Text(
@@ -2115,5 +2324,36 @@ private fun MediaKey(icon: ImageVector, modifier: Modifier = Modifier, onClick: 
         colors = ButtonDefaults.filledTonalButtonColors(containerColor = SurfaceElevated, contentColor = TextPrimary)
     ) {
         Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
+    }
+}
+
+
+@Composable
+private fun CompactNavTab(
+    label: String,
+    icon: ImageVector,
+    selected: Boolean,
+    accentColor: Color,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (selected) SurfaceElevated else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(vertical = 6.dp, horizontal = 2.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Icon(icon, contentDescription = label, tint = if (selected) accentColor else TextMuted, modifier = Modifier.size(18.dp))
+        Text(
+            text = label,
+            color = if (selected) TextPrimary else TextMuted,
+            fontSize = 10.sp,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
