@@ -591,12 +591,13 @@ class KodiClient(
             if (it.isSuccessful) it.body?.string() else null
         } ?: return null
         val isKodi = xml.contains("Kodi", true) || xml.contains("XBMC", true)
-        val serviceBlock = Regex(
-            """<service>[\s\S]*?ContentDirectory:1[\s\S]*?</service>""",
-            RegexOption.IGNORE_CASE
-        ).find(xml)?.value ?: return null
+        val cdBlock = Regex("""<service>([\s\S]*?)</service>""", RegexOption.IGNORE_CASE)
+            .findAll(xml)
+            .map { it.groupValues[1] }
+            .firstOrNull { it.contains("ContentDirectory:1", true) }
+            ?: return null
         val rel = Regex("""<controlURL>([^<]+)</controlURL>""", RegexOption.IGNORE_CASE)
-            .find(serviceBlock)?.groupValues?.getOrNull(1)?.trim() ?: return null
+            .find(cdBlock)?.groupValues?.getOrNull(1)?.trim() ?: return null
         URL(URL(locationUrl), rel).toString() to isKodi
     }.getOrNull()
 

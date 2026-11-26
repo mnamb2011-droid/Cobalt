@@ -1096,37 +1096,66 @@ private fun RemoteScreen(
             }
         }
 
-        // Sleek Top-Corner Live Scenario Timer & "Next Up" Banner (visible on Remote/Kodi/Apps tabs too!)
+        // Persistent Sleek Corner HUD for Live Scenario Timer & "Next Up" (always visible when running!)
         if (scenarioRunning && activeTab != RemoteTab.SCENARIO && scenarioStepIdx in scenarioSteps.indices) {
             val activeStep = scenarioSteps[scenarioStepIdx]
             val nextStep = scenarioSteps.getOrNull(scenarioStepIdx + 1)
-            Row(
+            val hudProgress = 1f - (scenarioRemainingSec.toFloat() / scenarioCurrentTotalSec.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Brush.horizontalGradient(listOf(SurfaceElevated, SurfaceCard)))
-                    .border(1.dp, Accent.copy(alpha = 0.7f), RoundedCornerShape(14.dp))
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Brush.horizontalGradient(listOf(Color(0xFF13273D), SurfaceCard)))
+                    .border(1.2.dp, Accent.copy(alpha = 0.75f), RoundedCornerShape(16.dp))
                     .clickable { activeTab = RemoteTab.SCENARIO }
-                    .padding(horizontal = 12.dp, vertical = 7.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Surface(color = Accent.copy(alpha = 0.18f), shape = RoundedCornerShape(8.dp)) {
-                    Text(
-                        text = "⏱ ${ScenarioStore.formatTimestamp(scenarioRemainingSec)}",
-                        color = Accent,
-                        fontWeight = FontWeight.Black,
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                    )
-                }
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(activeStep.title, color = TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    if (nextStep != null) {
-                        Text("التالي: ${nextStep.title}", color = Warning, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Surface(color = Accent.copy(alpha = 0.18f), shape = RoundedCornerShape(10.dp)) {
+                        Text(
+                            text = ScenarioStore.formatTimestamp(scenarioRemainingSec),
+                            color = Accent,
+                            fontWeight = FontWeight.Black,
+                            fontSize = 16.sp,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        )
+                    }
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            text = "الآن: ${activeStep.title}",
+                            color = TextPrimary,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = if (nextStep != null) "التالي: ${nextStep.title}" else "التالي: انتهاء السيناريو",
+                            color = Warning,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    IconButton(
+                        onClick = { scenarioSkipSignal?.complete(Unit) },
+                        modifier = Modifier.size(32.dp).clip(CircleShape).background(SurfaceElevated)
+                    ) {
+                        Icon(Icons.Rounded.SkipNext, contentDescription = "تخطي للتالي", tint = Accent, modifier = Modifier.size(19.dp))
                     }
                 }
-                Icon(Icons.Rounded.SkipNext, contentDescription = "تخطي", tint = Accent, modifier = Modifier.size(20.dp).clickable { scenarioSkipSignal?.complete(Unit) })
+                LinearProgressIndicator(
+                    progress = { hudProgress },
+                    modifier = Modifier.fillMaxWidth().height(4.dp).clip(CircleShape),
+                    color = Accent,
+                    trackColor = BorderSubtle
+                )
             }
         }
 
