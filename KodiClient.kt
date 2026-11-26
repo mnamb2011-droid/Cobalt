@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.*
@@ -57,10 +58,15 @@ data class KodiEpisode(
     val file: String
 )
 
+data class PhoneStreamResult(
+    val url: String?,
+    val diagnostic: String
+)
+
 /**
  * Kodi JSON-RPC client for LG webOS (WebSocket/TCP port 9090, no auth required).
- * Supports Movies, TV Shows, Episodes, direct TV playback, Metahub/Cinemeta posters,
- * and UPnP/DLNA ContentDirectory Browse + Search stream resolution for phone playback.
+ * Supports Movies, TV Shows, Episodes, seek-to-timestamp, Metahub/Cinemeta posters,
+ * and UPnP/DLNA ContentDirectory Browse + Root-walk stream resolution for phone playback.
  */
 class KodiClient(
     private val host: String,
@@ -315,13 +321,36 @@ class KodiClient(
         }.sortedWith(compareBy<KodiEpisode> { it.season }.thenBy { it.episode })
     }
 
-    suspend fun playMovie(movieId: Int, filePath: String? = null) {
+    suspend fun playMovie(movieId: Int, filePath: String? = null, startAtSec: Int = 0) {
         try {
             call("Player.Open", JSONObject().put("item", JSONObject().put("movieid", movieId)))
         } catch (e: Exception) {
             if (!filePath.isNullOrBlank()) {
                 call("Player.Open", JSONObject().put("item", JSONObject().put("file", filePath)))
             } else throw e
+        }
+        if (startAtSec > 0) {
+            seekToSeconds(startAtSec)
+        }
+    }
+
+    suspend fun seekToSeconds(seconds: Int) {
+        if (seconds <= 0) return
+        val h = seconds / 3600
+        val m = (seconds % 3600) / 60
+        val s = seconds % 60
+        repeat(6) {
+            delay(900)
+            val active = runCatching { call("Player.GetActivePlayers").optJSONArray("result") }.getOrNull()
+            val playerId = active?.optJSONObject(0)?.optInt("playerid", -1) ?: -1
+            if (playerId >= 0) {
+                val timeObj = JSONObject().put("hours", h).put("minutes", m).put("seconds", s)
+                val seekParams = JSONObject()
+                    .put("playerid", playerId)
+                    .put("value", JSONObject().put("time", timeObj))
+                runCatching { call("Player.Seek", seekParams) }
+                return
+            }
         }
     }
 
@@ -337,8 +366,8 @@ class KodiClient(
 
     /**
      * Resolves an HTTP video stream URL for playing a Kodi movie/episode on the Android phone.
-     * Uses WifiManager.MulticastLock + scans all UPnP devices on TV IP to find Kodi ContentDirectory:1,
-     * then queries BrowseMetadata by Kodi's exact videodb:// ObjectID, with BrowseDirectChildren & Search fallbacks.
+     * Sends both Multicast + direct Unicast SSDP to TV IP, walks UPnP containers from root if needed,
+     * and returns a precise Arabic diagnostic if Kodi's UPnP server is unreachable.
      */
     suspend fun resolvePhoneStreamUrl(
         context: Context,
@@ -346,10 +375,10 @@ class KodiClient(
         filePath: String,
         movieId: Int? = null,
         episodeId: Int? = null
-    ): String? = withContext(Dispatchers.IO) {
+    ): PhoneStreamResult = withContext(Dispatchers.IO) {
         val cleanPath = filePath.trim()
         if (cleanPath.startsWith("http://", true) || cleanPath.startsWith("https://", true)) {
-            return@withContext cleanPath
+            return@withContext PhoneStreamResult(cleanPath, "رابط مباشر")
         }
 
         val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
@@ -361,54 +390,65 @@ class KodiClient(
         }.getOrNull()
 
         try {
-            val controlUrl = cachedContentDirControlUrl ?: discoverKodiContentDirectoryUrl()?.also {
-                cachedContentDirControlUrl = it
-            }
+            val (controlUrl, foundLocs) = cachedContentDirControlUrl?.let { it to 1 }
+                ?: discoverKodiContentDirectoryUrl()
             if (controlUrl != null) {
-                // 1. Direct BrowseMetadata using Kodi's exact Platinum UPnP ObjectIDs
+                cachedContentDirControlUrl = controlUrl
+
+                // 1. Direct BrowseMetadata using Kodi's Platinum UPnP ObjectIDs
                 val directIds = buildList {
-                    if (movieId != null) {
-                        add("videodb://movies/titles/$movieId")
-                    }
-                    if (episodeId != null) {
-                        add("videodb://tvshows/titles/-1/-1/$episodeId")
-                    }
+                    if (movieId != null) add("videodb://movies/titles/$movieId")
+                    if (episodeId != null) add("videodb://tvshows/titles/-1/-1/$episodeId")
                 }
                 for (objId in directIds) {
                     upnpBrowse(controlUrl, objId, "BrowseMetadata", 1)?.let { xml ->
-                        extractFirstHttpRes(xml)?.let { return@withContext it }
+                        extractFirstHttpRes(xml)?.let { return@withContext PhoneStreamResult(it, "UPnP مباشر") }
                     }
                 }
 
-                // 2. BrowseDirectChildren of movies container and match by title or filename
+                // 2. BrowseDirectChildren on movies container
                 if (movieId != null) {
                     upnpBrowse(controlUrl, "videodb://movies/titles/", "BrowseDirectChildren", 500)?.let { xml ->
-                        findMatchingItemRes(xml, title, cleanPath)?.let { return@withContext it }
+                        findMatchingItemRes(xml, title, cleanPath)?.let { return@withContext PhoneStreamResult(it, "UPnP قائمة الأفلام") }
                     }
                 }
 
-                // 3. Fallback: UPnP Search by title
-                upnpSearch(controlUrl, title)?.let { xml ->
-                    extractFirstHttpRes(xml)?.let { return@withContext it }
+                // 3. Walk from root container "0" -> Video Library -> Movies/Titles
+                walkUpnpFromRoot(controlUrl, title, cleanPath, isEpisode = episodeId != null)?.let {
+                    return@withContext PhoneStreamResult(it, "UPnP جذر المكتبة")
                 }
+
+                // 4. Fallback: UPnP Search
+                upnpSearch(controlUrl, title)?.let { xml ->
+                    extractFirstHttpRes(xml)?.let { return@withContext PhoneStreamResult(it, "UPnP بحث") }
+                }
+
+                return@withContext PhoneStreamResult(
+                    null,
+                    "تم الاتصال بخادم UPnP لكودي لكن تعذر إيجاد رابط البث لهذا الملف"
+                )
+            } else {
+                // Fallback: HTTP VFS :8080 if enabled
+                if (cleanPath.isNotEmpty()) {
+                    val vfsUrl = "http://$host:8080/vfs/${URLEncoder.encode(cleanPath, "UTF-8")}"
+                    val ok = runCatching {
+                        http.newCall(Request.Builder().url(vfsUrl).head().build()).execute().use { it.isSuccessful }
+                    }.getOrDefault(false)
+                    if (ok) return@withContext PhoneStreamResult(vfsUrl, "HTTP VFS")
+                }
+                val diag = if (foundLocs == 0) {
+                    "لم يرد خادم UPnP من $host — أعد تشغيل كودي بعد تفعيل (تفعيل دعم UPnP + مشاركة المكتبات الخاصة بي)"
+                } else {
+                    "وُجد $foundLocs جهاز UPnP على $host بدون خدمة مشاركة مكتبة كودي (أغلق كودي وأعد فتحه بعد التفعيل)"
+                }
+                return@withContext PhoneStreamResult(null, diag)
             }
         } finally {
             runCatching { if (lock?.isHeld == true) lock.release() }
         }
-
-        // 4. Fallback: Kodi HTTP VFS (:8080/vfs/...) if HTTP server is enabled
-        if (cleanPath.isNotEmpty()) {
-            val vfsUrl = "http://$host:8080/vfs/${URLEncoder.encode(cleanPath, "UTF-8")}"
-            val ok = runCatching {
-                val req = Request.Builder().url(vfsUrl).head().build()
-                http.newCall(req).execute().use { it.isSuccessful }
-            }.getOrDefault(false)
-            if (ok) return@withContext vfsUrl
-        }
-        null
     }
 
-    private fun discoverKodiContentDirectoryUrl(): String? {
+    private fun discoverKodiContentDirectoryUrl(): Pair<String?, Int> {
         val locations = LinkedHashSet<String>()
         val queries = listOf(
             "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:service:ContentDirectory:1\r\n\r\n",
@@ -417,11 +457,17 @@ class KodiClient(
         )
         runCatching {
             DatagramSocket().use { socket ->
-                socket.soTimeout = 1800
+                socket.broadcast = true
+                socket.soTimeout = 1600
                 val group = InetAddress.getByName("239.255.255.250")
+                val tvAddr = runCatching { InetAddress.getByName(host) }.getOrNull()
                 queries.forEach { q ->
                     val b = q.toByteArray()
                     socket.send(DatagramPacket(b, b.size, group, 1900))
+                    // Direct unicast M-SEARCH to TV IP bypasses router multicast filtering!
+                    if (tvAddr != null) {
+                        runCatching { socket.send(DatagramPacket(b, b.size, tvAddr, 1900)) }
+                    }
                 }
                 val buf = ByteArray(2048)
                 val deadline = System.currentTimeMillis() + 2600
@@ -440,11 +486,46 @@ class KodiClient(
                 }
             }
         }
-        // Inspect every UPnP device on the TV IP until we find Kodi's ContentDirectory:1 service
         for (loc in locations) {
-            fetchContentDirectoryControlUrl(loc)?.let { return it }
+            fetchContentDirectoryControlUrl(loc)?.let { return it to locations.size }
+        }
+        return null to locations.size
+    }
+
+    private fun walkUpnpFromRoot(controlUrl: String, title: String, filePath: String, isEpisode: Boolean): String? {
+        val rootXml = upnpBrowse(controlUrl, "0", "BrowseDirectChildren", 30) ?: return null
+        val rootContainers = parseContainerIds(rootXml)
+        // Look for Video Library container (often "library://video/" or similar)
+        val videoIds = rootContainers.filter { (id, lbl) ->
+            id.contains("video", true) || lbl.contains("video", true) || lbl.contains("فيديو") || lbl.contains("أفلام")
+        }.map { it.first }.ifEmpty { rootContainers.map { it.first } }
+
+        for (vidId in videoIds.take(4)) {
+            val lvl1 = upnpBrowse(controlUrl, vidId, "BrowseDirectChildren", 30) ?: continue
+            findMatchingItemRes(lvl1, title, filePath)?.let { return it }
+            val subContainers = parseContainerIds(lvl1).filter { (id, lbl) ->
+                if (isEpisode) id.contains("tvshow", true) || lbl.contains("مسلسل") || lbl.contains("tv", true)
+                else id.contains("movie", true) || lbl.contains("فيلم") || lbl.contains("أفلام") || lbl.contains("title", true)
+            }
+            for ((subId, _) in subContainers.take(3)) {
+                val lvl2 = upnpBrowse(controlUrl, subId, "BrowseDirectChildren", 500) ?: continue
+                findMatchingItemRes(lvl2, title, filePath)?.let { return it }
+                val titleContainers = parseContainerIds(lvl2).filter { (id, lbl) ->
+                    id.contains("title", true) || lbl.contains("عناوين") || lbl.contains("title", true)
+                }
+                for ((tId, _) in titleContainers.take(2)) {
+                    val lvl3 = upnpBrowse(controlUrl, tId, "BrowseDirectChildren", 500) ?: continue
+                    findMatchingItemRes(lvl3, title, filePath)?.let { return it }
+                }
+            }
         }
         return null
+    }
+
+    private fun parseContainerIds(rawXml: String): List<Pair<String, String>> {
+        val didl = unescapeDidl(rawXml)
+        val regex = Regex("""<container\b[^>]*\bid="([^"]+)"[^>]*>[\s\S]*?<dc:title>([^<]*)</dc:title>""", RegexOption.IGNORE_CASE)
+        return regex.findAll(didl).map { it.groupValues[1] to it.groupValues[2] }.toList()
     }
 
     private fun fetchContentDirectoryControlUrl(locationUrl: String): String? = runCatching {

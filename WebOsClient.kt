@@ -328,8 +328,12 @@ class WebOsClient(
     }.getOrNull()
 
     /** Launches a specific YouTube video directly in Cobalt YouTube via verified contentTarget. */
-    suspend fun playYouTubeVideo(appId: String, videoId: String) {
-        val contentTarget = "https://www.youtube.com/watch?v=$videoId"
+    suspend fun playYouTubeVideo(appId: String, videoId: String, startAtSec: Int = 0) {
+        val contentTarget = if (startAtSec > 0) {
+            "https://www.youtube.com/watch?v=$videoId&t=${startAtSec}s"
+        } else {
+            "https://www.youtube.com/watch?v=$videoId"
+        }
         val params = JSONObject().put("contentTarget", contentTarget)
         val payload = JSONObject().put("id", appId).put("params", params)
         try {

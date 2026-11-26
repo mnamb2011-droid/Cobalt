@@ -12,6 +12,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -21,9 +22,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -31,6 +34,8 @@ import androidx.compose.ui.unit.*
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import coil.compose.AsyncImage
+import kotlinx.coroutines.launch
 
 private val TabInk = Color(0xFF0A101D)
 private val TabCard = Color(0xFF131D30)
@@ -62,7 +67,6 @@ internal fun StreamTabContent(
         modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // Stream URL input bar
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -111,7 +115,6 @@ internal fun StreamTabContent(
             }
         }
 
-        // 16:9 Live Stream Viewer Box
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -141,7 +144,6 @@ internal fun StreamTabContent(
                                     """.trimIndent()
                                     loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
                                 } else {
-                                    // Works for MJPEG streams (piccap/hyperion-webos) and web streams
                                     val html = """
                                         <html><body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;height:100vh;">
                                         <img src="$activeUrl" style="width:100%;height:100%;object-fit:contain;" onerror="document.body.innerHTML='<div style=color:#ffc861;font-family:sans-serif;text-align:center;padding:16px;direction:rtl>تعذر فتح البث على هذا الرابط.<br/>تأكد من تشغيل خدمة البث على التلفزيون (مثل piccap) أو افتح الرابط بمشغل خارجي.</div>'"/>
@@ -163,7 +165,7 @@ internal fun StreamTabContent(
                     Icon(Icons.Rounded.Cast, contentDescription = null, tint = TabAccent.copy(alpha = 0.7f), modifier = Modifier.size(38.dp))
                     Text("بث شاشة التلفزيون أو الفيديو على الهاتف", color = TabText, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, textAlign = TextAlign.Center)
                     Text(
-                        "نظام LG webOS الرسمي لا يبث صورة الشاشة لاسلكياً للتطبيقات بدون خدمة التقاط على التلفزيون (مثل piccap/Hyperion على الأجهزة المروّتة). يمكنك لصق أي رابط بث MJPEG أو HLS أو فيديو هنا لمشاهدته مباشرة.",
+                        "نظام LG webOS الرسمي لا يبث صورة الشاشة لاسلكياً للتطبيقات بدون خدمة التقاط على التلفزيون (مثل piccap/Hyperion). يمكنك لصق أي رابط بث MJPEG أو HLS أو فيديو هنا لمشاهدته مباشرة.",
                         color = TabMuted,
                         fontSize = 11.sp,
                         textAlign = TextAlign.Center
@@ -172,7 +174,6 @@ internal fun StreamTabContent(
             }
         }
 
-        // Quick stream action buttons (Stop / Reload / Open in VLC)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -220,7 +221,6 @@ internal fun StreamTabContent(
             }
         }
 
-        // Quick Mini Remote Controls while watching stream
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -256,12 +256,14 @@ internal fun ScenarioTabContent(
     running: Boolean,
     currentStepIndex: Int,
     remainingSec: Int,
+    currentTotalSec: Int,
     kodiMovies: List<KodiMovie>,
     tvInputs: List<TvInput>,
     tvApps: List<TvApp>,
     onAddStep: (ScenarioStep) -> Unit,
     onRemoveStep: (String) -> Unit,
     onMoveStep: (Int, Int) -> Unit,
+    onResetStepProgress: (String) -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onSkipNext: () -> Unit,
@@ -276,10 +278,8 @@ internal fun ScenarioTabContent(
         // Live Running Countdown Banner
         if (running && currentStepIndex in steps.indices) {
             val active = steps[currentStepIndex]
-            val totalSec = (active.durationMinutes * 60).coerceAtLeast(1)
-            val progress = 1f - (remainingSec.toFloat() / totalSec.toFloat()).coerceIn(0f, 1f)
-            val mins = remainingSec / 60
-            val secs = remainingSec % 60
+            val total = currentTotalSec.coerceAtLeast(1)
+            val progress = 1f - (remainingSec.toFloat() / total.toFloat()).coerceIn(0f, 1f)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -311,9 +311,9 @@ internal fun ScenarioTabContent(
                         )
                     }
                     Text(
-                        text = "%02d:%02d".format(mins, secs),
+                        text = ScenarioStore.formatTimestamp(remainingSec),
                         color = TabAccent,
-                        fontSize = 22.sp,
+                        fontSize = 21.sp,
                         fontWeight = FontWeight.Black
                     )
                 }
@@ -342,12 +342,11 @@ internal fun ScenarioTabContent(
                     ) {
                         Icon(Icons.Rounded.Stop, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
-                        Text("إيقاف السيناريو", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text("إيقاف وحفظ الموضع", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
         } else {
-            // Top Action Row: Start Scenario + Add Step
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -361,7 +360,7 @@ internal fun ScenarioTabContent(
                 ) {
                     Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text("بدء السيناريو (${steps.sumOf { it.durationMinutes }} د)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    Text("بدء السيناريو", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 }
                 FilledTonalButton(
                     onClick = { showAddDialog = true },
@@ -389,7 +388,7 @@ internal fun ScenarioTabContent(
                     Icon(Icons.Rounded.Schedule, contentDescription = null, tint = TabAccent.copy(alpha = 0.7f), modifier = Modifier.size(40.dp))
                     Text("منسّق التشغيل المتتابع (السيناريو)", color = TabText, fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     Text(
-                        "رتّب خطواتك بمدد زمنية محددة: مثلاً 30 دقيقة فيديو يوتيوب ← 15 دقيقة فيلم من كودي ← 20 دقيقة مخرج HDMI ← إيقاف التلفزيون.",
+                        "ابحث واختر فيديوهات يوتيوب أو أفلام كودي أو مداخل HDMI مع تحديد المدة أو تشغيل الفيديو كاملاً، والاستكمال التلقائي من حيث توقف في المرة السابقة.",
                         color = TabMuted,
                         fontSize = 12.sp,
                         textAlign = TextAlign.Center
@@ -438,27 +437,36 @@ internal fun ScenarioTabContent(
                         ) {
                             Text("${idx + 1}", color = typeColor, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                         }
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                             Text(step.title, color = TabText, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text(step.type.labelAr, color = typeColor, fontSize = 11.sp)
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text(step.type.labelAr, color = typeColor, fontSize = 10.sp)
                                 if (step.type != ScenarioActionType.POWER_OFF) {
-                                    Text("• ${step.durationMinutes} دقيقة", color = TabMuted, fontSize = 11.sp)
+                                    val durLabel = if (step.playFullVideo) "الفيديو كامل" else "${step.durationMinutes} دقيقة"
+                                    Text("• $durLabel", color = TabMuted, fontSize = 10.sp)
+                                }
+                                if ((step.type == ScenarioActionType.YOUTUBE || step.type == ScenarioActionType.KODI_MOVIE) && step.startAtSec > 0) {
+                                    Text("• يبدأ ${ScenarioStore.formatTimestamp(step.startAtSec)}", color = TabAccent, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                                 }
                             }
                         }
                         if (!running) {
+                            if (step.startAtSec > 0 && (step.type == ScenarioActionType.YOUTUBE || step.type == ScenarioActionType.KODI_MOVIE)) {
+                                IconButton(onClick = { onResetStepProgress(step.id) }, modifier = Modifier.size(30.dp)) {
+                                    Icon(Icons.Rounded.RestartAlt, contentDescription = "تصفير وقت البداية", tint = TabAccent, modifier = Modifier.size(18.dp))
+                                }
+                            }
                             if (idx > 0) {
-                                IconButton(onClick = { onMoveStep(idx, idx - 1) }, modifier = Modifier.size(30.dp)) {
+                                IconButton(onClick = { onMoveStep(idx, idx - 1) }, modifier = Modifier.size(28.dp)) {
                                     Icon(Icons.Rounded.KeyboardArrowUp, contentDescription = "لأعلى", tint = TabMuted, modifier = Modifier.size(18.dp))
                                 }
                             }
                             if (idx < steps.lastIndex) {
-                                IconButton(onClick = { onMoveStep(idx, idx + 1) }, modifier = Modifier.size(30.dp)) {
+                                IconButton(onClick = { onMoveStep(idx, idx + 1) }, modifier = Modifier.size(28.dp)) {
                                     Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = "لأسفل", tint = TabMuted, modifier = Modifier.size(18.dp))
                                 }
                             }
-                            IconButton(onClick = { onRemoveStep(step.id) }, modifier = Modifier.size(30.dp)) {
+                            IconButton(onClick = { onRemoveStep(step.id) }, modifier = Modifier.size(28.dp)) {
                                 Icon(Icons.Rounded.DeleteOutline, contentDescription = "حذف", tint = TabDanger, modifier = Modifier.size(18.dp))
                             }
                         }
@@ -490,14 +498,34 @@ private fun AddScenarioStepDialog(
     onDismiss: () -> Unit,
     onAdd: (ScenarioStep) -> Unit
 ) {
+    val scope = rememberCoroutineScope()
     var selectedType by remember { mutableStateOf(ScenarioActionType.YOUTUBE) }
-    var durationText by remember { mutableStateOf("15") }
-    var ytInput by remember { mutableStateOf("") }
-    var ytLabel by remember { mutableStateOf("") }
+    var durationText by remember { mutableStateOf("10") }
+    var startMinText by remember { mutableStateOf("0") }
+    var playFullVideo by remember { mutableStateOf(false) }
+    var autoResume by remember { mutableStateOf(true) }
+
+    // YouTube Search + Direct URL state
+    var ytQuery by remember { mutableStateOf("") }
+    var ytSearching by remember { mutableStateOf(false) }
+    var ytResults by remember { mutableStateOf<List<YouTubeSearchResult>>(emptyList()) }
+    var ytSelectedVideo by remember { mutableStateOf<YouTubeSearchResult?>(null) }
+    var ytManualUrl by remember { mutableStateOf("") }
+
     var movieFilter by remember { mutableStateOf("") }
     var chosenMovie by remember { mutableStateOf<KodiMovie?>(kodiMovies.firstOrNull()) }
     var chosenInput by remember { mutableStateOf<TvInput?>(tvInputs.firstOrNull()) }
     var chosenApp by remember { mutableStateOf<TvApp?>(tvApps.firstOrNull()) }
+
+    fun runYtSearch() {
+        val q = ytQuery.trim()
+        if (q.isEmpty()) return
+        ytSearching = true
+        scope.launch {
+            ytResults = runCatching { WebOsClient.searchYouTube(q) }.getOrDefault(emptyList())
+            ytSearching = false
+        }
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -506,7 +534,8 @@ private fun AddScenarioStepDialog(
         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
             Column(
                 modifier = Modifier
-                    .fillMaxWidth(0.94f)
+                    .fillMaxWidth(0.95f)
+                    .fillMaxHeight(0.88f)
                     .clip(RoundedCornerShape(22.dp))
                     .background(TabCard)
                     .border(1.dp, TabBorder, RoundedCornerShape(22.dp))
@@ -540,28 +569,114 @@ private fun AddScenarioStepDialog(
                     }
                 }
 
-                // Type-specific target selector
+                // Type-specific selector
                 when (selectedType) {
                     ScenarioActionType.YOUTUBE -> {
-                        OutlinedTextField(
-                            value = ytInput,
-                            onValueChange = { ytInput = it },
+                        // In-dialog YouTube Search!
+                        Row(
                             modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            label = { Text("رابط فيديو يوتيوب أو معرّفه (11 حرفاً)", fontSize = 11.sp) },
-                            textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = TabText),
-                            shape = RoundedCornerShape(12.dp)
-                        )
-                        OutlinedTextField(
-                            value = ytLabel,
-                            onValueChange = { ytLabel = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            label = { Text("اسم توضيحي (اختياري)", fontSize = 11.sp) },
-                            textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = TabText),
-                            shape = RoundedCornerShape(12.dp)
-                        )
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = ytQuery,
+                                onValueChange = { ytQuery = it },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                placeholder = { Text("ابحث في يوتيوب لاختيار فيديو…", fontSize = 12.sp, color = TabMuted) },
+                                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = TabText),
+                                shape = RoundedCornerShape(12.dp),
+                                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                                keyboardActions = KeyboardActions(onSearch = { runYtSearch() })
+                            )
+                            FilledIconButton(
+                                onClick = { runYtSearch() },
+                                modifier = Modifier.size(46.dp),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = IconButtonDefaults.filledIconButtonColors(containerColor = TabYoutube, contentColor = Color.White)
+                            ) {
+                                Icon(Icons.Rounded.Search, contentDescription = "بحث", modifier = Modifier.size(20.dp))
+                            }
+                        }
+
+                        if (ytSearching) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                CircularProgressIndicator(color = TabYoutube, strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                                Text("جارٍ البحث في يوتيوب…", color = TabMuted, fontSize = 12.sp)
+                            }
+                        }
+
+                        if (ytSelectedVideo != null) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(TabYoutube.copy(alpha = 0.16f))
+                                    .border(1.dp, TabYoutube, RoundedCornerShape(12.dp))
+                                    .padding(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                AsyncImage(
+                                    model = ytSelectedVideo!!.thumbnailUrl,
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.width(72.dp).height(42.dp).clip(RoundedCornerShape(6.dp))
+                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(ytSelectedVideo!!.title, color = TabText, fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                    if (ytSelectedVideo!!.duration.isNotBlank()) {
+                                        Text("مدة الفيديو: ${ytSelectedVideo!!.duration}", color = TabAccent, fontSize = 10.sp)
+                                    }
+                                }
+                                IconButton(onClick = { ytSelectedVideo = null }, modifier = Modifier.size(28.dp)) {
+                                    Icon(Icons.Rounded.Close, contentDescription = "إزالة", tint = TabMuted, modifier = Modifier.size(16.dp))
+                                }
+                            }
+                        }
+
+                        if (ytResults.isNotEmpty() && ytSelectedVideo == null) {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                ytResults.take(6).forEach { vid ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(TabInk)
+                                            .border(1.dp, TabBorder, RoundedCornerShape(10.dp))
+                                            .clickable { ytSelectedVideo = vid }
+                                            .padding(6.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        AsyncImage(
+                                            model = vid.thumbnailUrl,
+                                            contentDescription = null,
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.width(76.dp).height(44.dp).clip(RoundedCornerShape(6.dp))
+                                        )
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(vid.title, color = TabText, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                            Text("${vid.channel} ${if (vid.duration.isNotBlank()) "• ${vid.duration}" else ""}", color = TabMuted, fontSize = 10.sp, maxLines = 1)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (ytSelectedVideo == null) {
+                            OutlinedTextField(
+                                value = ytManualUrl,
+                                onValueChange = { ytManualUrl = it },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true,
+                                label = { Text("أو الصق رابط فيديو يوتيوب مباشرة (اختياري)", fontSize = 11.sp) },
+                                textStyle = LocalTextStyle.current.copy(fontSize = 12.sp, color = TabText),
+                                shape = RoundedCornerShape(12.dp)
+                            )
+                        }
                     }
+
                     ScenarioActionType.KODI_MOVIE -> {
                         OutlinedTextField(
                             value = movieFilter,
@@ -574,7 +689,7 @@ private fun AddScenarioStepDialog(
                         )
                         val matches = remember(kodiMovies, movieFilter) {
                             val q = movieFilter.trim()
-                            (if (q.isEmpty()) kodiMovies else kodiMovies.filter { it.title.contains(q, true) }).take(8)
+                            (if (q.isEmpty()) kodiMovies else kodiMovies.filter { it.title.contains(q, true) }).take(6)
                         }
                         if (matches.isEmpty()) {
                             Text("حدّث مكتبة أفلام كودي أولاً من تبويب كودي.", color = TabWarning, fontSize = 12.sp)
@@ -593,12 +708,14 @@ private fun AddScenarioStepDialog(
                                         horizontalArrangement = Arrangement.SpaceBetween
                                     ) {
                                         Text(m.title, color = TabText, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                                        if (m.year > 0) Text("${m.year}", color = TabMuted, fontSize = 11.sp)
+                                        val dur = KodiClient.formatRuntime(m.runtimeSec)
+                                        Text(listOfNotNull(m.year.takeIf { it > 0 }?.toString(), dur.takeIf { it.isNotEmpty() }).joinToString(" • "), color = TabMuted, fontSize = 10.sp)
                                     }
                                 }
                             }
                         }
                     }
+
                     ScenarioActionType.HDMI -> {
                         val allInputs = tvInputs + TvInput("LIVE_TV", "التلفاز المباشر", "com.webos.app.livetv", true)
                         Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
@@ -620,12 +737,13 @@ private fun AddScenarioStepDialog(
                             }
                         }
                     }
+
                     ScenarioActionType.TV_APP -> {
                         if (tvApps.isEmpty()) {
                             Text("اتصل بالتلفزيون أولاً لتحميل التطبيقات.", color = TabWarning, fontSize = 12.sp)
                         } else {
                             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                tvApps.take(10).forEach { app ->
+                                tvApps.take(8).forEach { app ->
                                     val sel = chosenApp?.id == app.id
                                     Row(
                                         modifier = Modifier
@@ -642,14 +760,31 @@ private fun AddScenarioStepDialog(
                             }
                         }
                     }
+
                     ScenarioActionType.POWER_OFF -> {
                         Text("سيتم إيقاف تشغيل التلفزيون تلقائياً عند الوصول لهذه الخطوة.", color = TabMuted, fontSize = 12.sp)
                     }
                 }
 
-                // Duration picker (minutes)
-                if (selectedType != ScenarioActionType.POWER_OFF) {
-                    Text("المدة (بالدقائق):", color = TabMuted, fontSize = 12.sp)
+                // Video timing options: Full video vs Fixed minutes + Start Minute + Auto-Resume!
+                val isVideoStep = selectedType == ScenarioActionType.YOUTUBE || selectedType == ScenarioActionType.KODI_MOVIE
+                if (isVideoStep) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(TabInk)
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("تشغيل الفيديو بالكامل ثم الانتقال للتالي", color = TabText, fontSize = 12.sp)
+                        Switch(checked = playFullVideo, onCheckedChange = { playFullVideo = it })
+                    }
+                }
+
+                if (selectedType != ScenarioActionType.POWER_OFF && !playFullVideo) {
+                    Text("مدة المشاهدة (بالدقائق):", color = TabMuted, fontSize = 12.sp)
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(listOf(5, 10, 15, 20, 30, 45, 60)) { mins ->
                             FilterChip(
@@ -671,19 +806,56 @@ private fun AddScenarioStepDialog(
                     )
                 }
 
+                if (isVideoStep) {
+                    OutlinedTextField(
+                        value = startMinText,
+                        onValueChange = { startMinText = it.filter(Char::isDigit).take(3) },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("ابدأ الفيديو من الدقيقة (0 = من البداية)", fontSize = 11.sp) },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = TabText),
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(TabInk)
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("استكمال تلقائي في المرة القادمة", color = TabText, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            Text("يحفظ الدقيقة التي توقف عندها ليبدأ منها المرة التالية", color = TabMuted, fontSize = 10.sp)
+                        }
+                        Switch(checked = autoResume, onCheckedChange = { autoResume = it })
+                    }
+                }
+
                 Button(
                     onClick = {
-                        val mins = durationText.toIntOrNull()?.coerceIn(1, 360) ?: 15
+                        val mins = durationText.toIntOrNull()?.coerceIn(1, 360) ?: 10
+                        val startSec = (startMinText.toIntOrNull()?.coerceAtLeast(0) ?: 0) * 60
                         val step = when (selectedType) {
                             ScenarioActionType.YOUTUBE -> {
-                                val raw = ytInput.trim()
-                                val vid = WebOsClient.extractYouTubeVideoId(raw) ?: raw
+                                val sel = ytSelectedVideo
+                                val vid = sel?.videoId ?: run {
+                                    val raw = ytManualUrl.trim()
+                                    WebOsClient.extractYouTubeVideoId(raw) ?: raw
+                                }
                                 if (vid.isBlank()) return@Button
+                                val totalVidSec = sel?.duration?.let { ScenarioStore.parseDurationTextToSec(it) } ?: 0
                                 ScenarioStep(
                                     type = selectedType,
-                                    title = ytLabel.trim().ifBlank { "يوتيوب: $vid" },
+                                    title = sel?.title ?: "يوتيوب: $vid",
                                     target = vid,
-                                    durationMinutes = mins
+                                    durationMinutes = mins,
+                                    startAtSec = startSec,
+                                    videoDurationSec = totalVidSec,
+                                    playFullVideo = playFullVideo,
+                                    autoResume = autoResume
                                 )
                             }
                             ScenarioActionType.KODI_MOVIE -> {
@@ -693,7 +865,11 @@ private fun AddScenarioStepDialog(
                                     title = m.title,
                                     target = m.movieId.toString(),
                                     extra = m.file,
-                                    durationMinutes = mins
+                                    durationMinutes = mins,
+                                    startAtSec = startSec,
+                                    videoDurationSec = m.runtimeSec,
+                                    playFullVideo = playFullVideo,
+                                    autoResume = autoResume
                                 )
                             }
                             ScenarioActionType.HDMI -> {
@@ -703,7 +879,8 @@ private fun AddScenarioStepDialog(
                                     title = inp.label,
                                     target = inp.id,
                                     extra = inp.appId ?: "",
-                                    durationMinutes = mins
+                                    durationMinutes = mins,
+                                    autoResume = false
                                 )
                             }
                             ScenarioActionType.TV_APP -> {
@@ -712,7 +889,8 @@ private fun AddScenarioStepDialog(
                                     type = selectedType,
                                     title = app.title,
                                     target = app.id,
-                                    durationMinutes = mins
+                                    durationMinutes = mins,
+                                    autoResume = false
                                 )
                             }
                             ScenarioActionType.POWER_OFF -> {
@@ -720,7 +898,8 @@ private fun AddScenarioStepDialog(
                                     type = selectedType,
                                     title = "إيقاف التلفزيون",
                                     target = "power_off",
-                                    durationMinutes = 1
+                                    durationMinutes = 1,
+                                    autoResume = false
                                 )
                             }
                         }

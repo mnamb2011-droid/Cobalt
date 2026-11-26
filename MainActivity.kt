@@ -416,6 +416,8 @@ private fun RemoteScreen(
     var scenarioRunning by remember { mutableStateOf(false) }
     var scenarioStepIdx by remember { mutableIntStateOf(0) }
     var scenarioRemainingSec by remember { mutableIntStateOf(0) }
+    var scenarioCurrentTotalSec by remember { mutableIntStateOf(1) }
+    var scenarioStepElapsedSec by remember { mutableIntStateOf(0) }
     var scenarioJob by remember { mutableStateOf<Job?>(null) }
     var scenarioSkipSignal by remember { mutableStateOf<CompletableDeferred<Unit>?>(null) }
     var streamUrl by remember { mutableStateOf(savedStreamUrl) }
@@ -598,12 +600,13 @@ private fun RemoteScreen(
                 kodiStatus = "تعذر الاتصال بكودي لتشغيل الفيديو على الهاتف"
                 return@launch
             }
-            val url = kodi.resolvePhoneStreamUrl(context, title, filePath, movieId, episodeId)
+            val res = kodi.resolvePhoneStreamUrl(context, title, filePath, movieId, episodeId)
             kodiLoading = false
+            val url = res.url
             if (url != null) {
                 streamUrl = url
                 onSaveStreamUrl(url)
-                kodiStatus = "تم فتح «$title» على الهاتف"
+                kodiStatus = "تم فتح «$title» على الهاتف (${res.diagnostic})"
                 runCatching {
                     val intent = Intent(Intent.ACTION_VIEW).apply {
                         setDataAndType(Uri.parse(url), "video/*")
@@ -613,18 +616,36 @@ private fun RemoteScreen(
                     activeTab = RemoteTab.STREAM
                 }
             } else {
-                kodiStatus = "لتشغيل أفلام كودي على الهاتف فعّل في كودي: الإعدادات ← الخدمات ← UPnP / DLNA ← مشاركة مكتباتي"
+                kodiStatus = res.diagnostic
             }
         }
     }
 
+    fun saveStepResumeBookmark(stepId: String, watchedSec: Int) {
+        if (watchedSec <= 0) return
+        val updated = scenarioSteps.map { s ->
+            if (s.id == stepId && s.autoResume && (s.type == ScenarioActionType.YOUTUBE || s.type == ScenarioActionType.KODI_MOVIE)) {
+                val nextPos = s.startAtSec + watchedSec
+                val finalPos = if (s.videoDurationSec > 0 && nextPos >= s.videoDurationSec - 10) 0 else nextPos
+                s.copy(startAtSec = finalPos)
+            } else s
+        }
+        scenarioSteps = updated
+        onSaveScenario(ScenarioStore.serialize(updated))
+    }
+
     fun stopScenario() {
+        val currentStep = scenarioSteps.getOrNull(scenarioStepIdx)
+        if (currentStep != null && scenarioStepElapsedSec > 5) {
+            saveStepResumeBookmark(currentStep.id, scenarioStepElapsedSec)
+        }
         scenarioJob?.cancel()
         scenarioJob = null
         scenarioSkipSignal = null
         scenarioRunning = false
         scenarioRemainingSec = 0
-        transientNotice = "تم إيقاف السيناريو"
+        scenarioStepElapsedSec = 0
+        transientNotice = "تم إيقاف السيناريو وحفظ الموضع"
     }
 
     fun startScenario() {
@@ -634,24 +655,24 @@ private fun RemoteScreen(
         scenarioJob = scope.launch {
             val stepsSnapshot = scenarioSteps.toList()
             for (idx in stepsSnapshot.indices) {
-                val step = stepsSnapshot[idx]
+                val step = scenarioSteps.firstOrNull { it.id == stepsSnapshot[idx].id } ?: stepsSnapshot[idx]
                 scenarioStepIdx = idx
+                scenarioStepElapsedSec = 0
                 transientNotice = "سيناريو (${idx + 1}/${stepsSnapshot.size}): ${step.title}"
 
-                // Execute step action on LG TV
                 val tv = client
                 if (tv != null) {
                     runCatching {
                         when (step.type) {
                             ScenarioActionType.YOUTUBE -> {
                                 val ytId = resolveYouTubeAppId(tv.getForegroundAppId())
-                                tv.playYouTubeVideo(ytId, step.target)
+                                tv.playYouTubeVideo(ytId, step.target, step.startAtSec)
                             }
                             ScenarioActionType.KODI_MOVIE -> {
                                 val kodi = kodiClient
                                 val movieId = step.target.toIntOrNull()
                                 if (kodi != null && movieId != null && ensureKodiReady(kodi)) {
-                                    kodi.playMovie(movieId, step.extra)
+                                    kodi.playMovie(movieId, step.extra, step.startAtSec)
                                 }
                             }
                             ScenarioActionType.HDMI -> {
@@ -673,19 +694,32 @@ private fun RemoteScreen(
 
                 if (step.type == ScenarioActionType.POWER_OFF) break
 
-                val totalSec = (step.durationMinutes * 60).coerceAtLeast(1)
+                val totalSec = if (step.playFullVideo && step.videoDurationSec > 0) {
+                    (step.videoDurationSec - step.startAtSec + 5).coerceAtLeast(10)
+                } else {
+                    (step.durationMinutes * 60).coerceAtLeast(10)
+                }
+                scenarioCurrentTotalSec = totalSec
+
                 val skipDef = CompletableDeferred<Unit>()
                 scenarioSkipSignal = skipDef
                 var left = totalSec
+                var elapsed = 0
                 while (left > 0 && !skipDef.isCompleted) {
                     scenarioRemainingSec = left
+                    scenarioStepElapsedSec = elapsed
                     val waited = withTimeoutOrNull(1000) { skipDef.await(); true }
                     if (waited == true) break
                     left--
+                    elapsed++
+                }
+                if (elapsed > 5) {
+                    saveStepResumeBookmark(step.id, elapsed)
                 }
             }
             scenarioRunning = false
             scenarioRemainingSec = 0
+            scenarioStepElapsedSec = 0
             scenarioSkipSignal = null
             transientNotice = "انتهى تنفيذ السيناريو بنجاح"
         }
@@ -1480,6 +1514,7 @@ private fun RemoteScreen(
                     running = scenarioRunning,
                     currentStepIndex = scenarioStepIdx,
                     remainingSec = scenarioRemainingSec,
+                    currentTotalSec = scenarioCurrentTotalSec,
                     kodiMovies = kodiMovies,
                     tvInputs = tvInputs,
                     tvApps = apps,
@@ -1499,6 +1534,10 @@ private fun RemoteScreen(
                             scenarioSteps = list
                             onSaveScenario(ScenarioStore.serialize(scenarioSteps))
                         }
+                    },
+                    onResetStepProgress = { id ->
+                        scenarioSteps = scenarioSteps.map { if (it.id == id) it.copy(startAtSec = 0) else it }
+                        onSaveScenario(ScenarioStore.serialize(scenarioSteps))
                     },
                     onStart = { startScenario() },
                     onStop = { stopScenario() },
