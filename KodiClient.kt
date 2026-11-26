@@ -198,6 +198,18 @@ class KodiClient(
         call("JSONRPC.Ping").optString("result") == "pong"
     }.getOrDefault(false)
 
+    suspend fun showNotification(title: String, message: String, displayMs: Int = 5000) {
+        runCatching {
+            call(
+                "GUI.ShowNotification",
+                JSONObject()
+                    .put("title", title)
+                    .put("message", message)
+                    .put("displaytime", displayMs)
+            )
+        }
+    }
+
     private fun extractImdbId(obj: JSONObject): String? {
         val unique = obj.optJSONObject("uniqueid")
         val fromUnique = unique?.optString("imdb")?.trim()
@@ -507,10 +519,15 @@ class KodiClient(
                 }
             }
         }
+        var fallbackUrl: String? = null
         for (loc in locations) {
-            fetchContentDirectoryControlUrl(loc)?.let { return it to locations.size }
+            val info = fetchContentDirectoryInfo(loc)
+            if (info != null) {
+                if (info.second) return info.first to locations.size // Exact Kodi/XBMC server!
+                if (fallbackUrl == null) fallbackUrl = info.first
+            }
         }
-        return null to locations.size
+        return fallbackUrl to locations.size
     }
 
     private fun bfsUpnpFromRoot(
@@ -520,7 +537,8 @@ class KodiClient(
         filePath: String,
         targetId: Int?
     ): Pair<String?, String> {
-        val rootXml = upnpBrowse(controlUrl, "0", "BrowseDirectChildren", 50) ?: return null to "فارغ"
+        val (rootXml, rootCode) = upnpBrowseWithCode(controlUrl, "0", "BrowseDirectChildren", 50)
+        if (rootXml == null) return null to "HTTP $rootCode @ ${controlUrl.substringAfter("://").take(32)}"
         findMatchingItemRes(rootXml, title, originalTitle, filePath, targetId)?.let { return it to "ok" }
         val rootContainers = parseContainerIds(rootXml)
         val summary = rootContainers.take(3).joinToString(",") { it.first.take(22) }.ifBlank { "0" }
@@ -567,44 +585,50 @@ class KodiClient(
         return regex.findAll(didl).map { it.groupValues[1] to it.groupValues[2] }.toList()
     }
 
-    private fun fetchContentDirectoryControlUrl(locationUrl: String): String? = runCatching {
+    /** Returns Pair(controlUrl, isKodiServer) */
+    private fun fetchContentDirectoryInfo(locationUrl: String): Pair<String, Boolean>? = runCatching {
         val xml = http.newCall(Request.Builder().url(locationUrl).build()).execute().use {
             if (it.isSuccessful) it.body?.string() else null
         } ?: return null
+        val isKodi = xml.contains("Kodi", true) || xml.contains("XBMC", true)
         val serviceBlock = Regex(
             """<service>[\s\S]*?ContentDirectory:1[\s\S]*?</service>""",
             RegexOption.IGNORE_CASE
         ).find(xml)?.value ?: return null
         val rel = Regex("""<controlURL>([^<]+)</controlURL>""", RegexOption.IGNORE_CASE)
             .find(serviceBlock)?.groupValues?.getOrNull(1)?.trim() ?: return null
-        URL(URL(locationUrl), rel).toString()
+        URL(URL(locationUrl), rel).toString() to isKodi
     }.getOrNull()
 
-    private fun upnpBrowse(controlUrl: String, objectId: String, browseFlag: String, count: Int): String? {
+    private fun upnpBrowse(controlUrl: String, objectId: String, browseFlag: String, count: Int): String? =
+        upnpBrowseWithCode(controlUrl, objectId, browseFlag, count).first
+
+    private fun upnpBrowseWithCode(controlUrl: String, objectId: String, browseFlag: String, count: Int): Pair<String?, Int> {
         val escapedId = objectId.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        val soap = """
-            <?xml version="1.0" encoding="utf-8"?>
-            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-              <s:Body>
-                <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
-                  <ObjectID>$escapedId</ObjectID>
-                  <BrowseFlag>$browseFlag</BrowseFlag>
-                  <Filter>*</Filter>
-                  <StartingIndex>0</StartingIndex>
-                  <RequestedCount>$count</RequestedCount>
-                  <SortCriteria></SortCriteria>
-                </u:Browse>
-              </s:Body>
-            </s:Envelope>
-        """.trimIndent()
+        val soap = """<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+      <ObjectID>$escapedId</ObjectID>
+      <BrowseFlag>$browseFlag</BrowseFlag>
+      <Filter>*</Filter>
+      <StartingIndex>0</StartingIndex>
+      <RequestedCount>$count</RequestedCount>
+      <SortCriteria></SortCriteria>
+    </u:Browse>
+  </s:Body>
+</s:Envelope>"""
         return runCatching {
             val req = Request.Builder()
                 .url(controlUrl)
                 .header("SOAPACTION", "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"")
+                .header("Content-Type", "text/xml; charset=\"utf-8\"")
                 .post(soap.toRequestBody(xmlMediaType))
                 .build()
-            http.newCall(req).execute().use { if (it.isSuccessful) it.body?.string() else null }
-        }.getOrNull()
+            http.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) resp.body?.string() to resp.code else null to resp.code
+            }
+        }.getOrDefault(null to -1)
     }
 
     private fun upnpSearch(controlUrl: String, title: String): String? {

@@ -186,7 +186,8 @@ class WebOsClient(
                 "CONTROL_POWER", "READ_APP_STATUS", "READ_RUNNING_APPS",
                 "CONTROL_INPUT_TEXT", "CONTROL_MOUSE_AND_KEYBOARD",
                 "READ_INSTALLED_APPS", "READ_NETWORK_STATE", "READ_POWER_STATE",
-                "READ_INPUT_DEVICE_LIST", "CONTROL_INPUT_TV"
+                "READ_INPUT_DEVICE_LIST", "CONTROL_INPUT_TV",
+                "CONTROL_DISPLAY", "WRITE_NOTIFICATION_TOAST", "WRITE_NOTIFICATION_ALERT"
             )
         )
         val manifest = JSONObject()

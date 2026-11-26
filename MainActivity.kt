@@ -708,7 +708,11 @@ private fun RemoteScreen(
                 val nextSuffix = if (nextStepTitle != null) "  |  التالي: $nextStepTitle" else "  |  الخطوة الأخيرة"
                 if (showTvTimer && tv != null) {
                     val startLabel = if (step.startAtSec > 0) " (من ${ScenarioStore.formatTimestamp(step.startAtSec)})" else ""
-                    tv.showToast("▶ ${step.title}$startLabel  •  ⏱ ${ScenarioStore.formatTimestamp(totalSec)}$nextSuffix")
+                    val msg = "▶ ${step.title}$startLabel  •  ⏱ ${ScenarioStore.formatTimestamp(totalSec)}$nextSuffix"
+                    tv.showToast(msg)
+                    if (step.type == ScenarioActionType.KODI_MOVIE) {
+                        kodiClient?.showNotification("⏱ ${ScenarioStore.formatTimestamp(totalSec)}", "${step.title}$nextSuffix")
+                    }
                 }
 
                 val skipDef = CompletableDeferred<Unit>()
@@ -719,7 +723,11 @@ private fun RemoteScreen(
                     scenarioRemainingSec = left
                     scenarioStepElapsedSec = elapsed
                     if (showTvTimer && tv != null && elapsed > 0 && (left == 15 || left == 60 || left == 120 || (left > 120 && left % 300 == 0))) {
-                        tv.showToast("⏱ متبقي ${ScenarioStore.formatTimestamp(left)}$nextSuffix")
+                        val msg = "⏱ متبقي ${ScenarioStore.formatTimestamp(left)}$nextSuffix"
+                        tv.showToast(msg)
+                        if (step.type == ScenarioActionType.KODI_MOVIE) {
+                            kodiClient?.showNotification("⏱ متبقي ${ScenarioStore.formatTimestamp(left)}", nextStepTitle?.let { "التالي: $it" } ?: "الخطوة الأخيرة")
+                        }
                     }
                     val waited = withTimeoutOrNull(1000) { skipDef.await(); true }
                     if (waited == true) break
