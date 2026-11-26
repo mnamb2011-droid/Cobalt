@@ -185,7 +185,8 @@ class WebOsClient(
                 "CONTROL_AUDIO", "CONTROL_INPUT_JOYSTICK", "CONTROL_INPUT_MEDIA_PLAYBACK",
                 "CONTROL_POWER", "READ_APP_STATUS", "READ_RUNNING_APPS",
                 "CONTROL_INPUT_TEXT", "CONTROL_MOUSE_AND_KEYBOARD",
-                "READ_INSTALLED_APPS", "READ_NETWORK_STATE", "READ_POWER_STATE"
+                "READ_INSTALLED_APPS", "READ_NETWORK_STATE", "READ_POWER_STATE",
+                "READ_INPUT_DEVICE_LIST", "CONTROL_INPUT_TV"
             )
         )
         val manifest = JSONObject()
@@ -381,20 +382,32 @@ class WebOsClient(
     }
 
     suspend fun getExternalInputs(): List<TvInput> {
-        val arr = request("tv/getExternalInputList")
-            .optJSONObject("payload")
-            ?.optJSONArray("devices") ?: JSONArray()
-        return (0 until arr.length()).mapNotNull { i ->
-            arr.optJSONObject(i)?.let { d ->
-                val id = d.optString("id").takeIf { it.isNotBlank() } ?: return@let null
-                TvInput(
-                    id = id,
-                    label = d.optString("label").ifBlank { id },
-                    appId = d.optString("appId").takeIf { it.isNotBlank() },
-                    connected = d.optBoolean("connected", false)
-                )
+        val devices = runCatching {
+            val arr = request("tv/getExternalInputList")
+                .optJSONObject("payload")
+                ?.optJSONArray("devices") ?: JSONArray()
+            (0 until arr.length()).mapNotNull { i ->
+                arr.optJSONObject(i)?.let { d ->
+                    val id = d.optString("id").takeIf { it.isNotBlank() } ?: return@let null
+                    TvInput(
+                        id = id,
+                        label = d.optString("label").ifBlank { id },
+                        appId = d.optString("appId").takeIf { it.isNotBlank() },
+                        connected = d.optBoolean("connected", false)
+                    )
+                }
             }
-        }
+        }.getOrDefault(emptyList())
+
+        if (devices.isNotEmpty()) return devices
+
+        // Guaranteed fallback HDMI 1-4 inputs via built-in webOS HDMI launcher appIds (works without extra permissions)
+        return listOf(
+            TvInput("HDMI_1", "HDMI 1", "com.webos.app.hdmi1", false),
+            TvInput("HDMI_2", "HDMI 2", "com.webos.app.hdmi2", false),
+            TvInput("HDMI_3", "HDMI 3", "com.webos.app.hdmi3", false),
+            TvInput("HDMI_4", "HDMI 4", "com.webos.app.hdmi4", false)
+        )
     }
 
     suspend fun switchInput(input: TvInput) {

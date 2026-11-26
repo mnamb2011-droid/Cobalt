@@ -366,7 +366,16 @@ private fun RemoteScreen(
     var certificatePin by remember { mutableStateOf(savedFingerprint) }
     var client by remember { mutableStateOf<WebOsClient?>(null) }
     var apps by remember { mutableStateOf<List<TvApp>>(emptyList()) }
-    var tvInputs by remember { mutableStateOf<List<TvInput>>(emptyList()) }
+    var tvInputs by remember {
+        mutableStateOf(
+            listOf(
+                TvInput("HDMI_1", "HDMI 1", "com.webos.app.hdmi1", false),
+                TvInput("HDMI_2", "HDMI 2", "com.webos.app.hdmi2", false),
+                TvInput("HDMI_3", "HDMI 3", "com.webos.app.hdmi3", false),
+                TvInput("HDMI_4", "HDMI 4", "com.webos.app.hdmi4", false)
+            )
+        )
+    }
     var showInputsDialog by remember { mutableStateOf(false) }
     var volume by remember { mutableFloatStateOf(20f) }
     var activeTab by remember { mutableStateOf(RemoteTab.REMOTE) }
@@ -1618,7 +1627,20 @@ private fun RemoteScreen(
                             onClick = {
                                 showInputsDialog = false
                                 transientNotice = "مشغّل الوسائط / USB"
-                                command { it.launchApp("com.webos.app.photovideo") }
+                                val mediaAppId = apps.firstOrNull {
+                                    it.id.contains("mediadiscovery", true) ||
+                                        it.id.contains("photovideo", true) ||
+                                        it.title.contains("وسائط") ||
+                                        it.title.contains("Media", true)
+                                }?.id
+                                command { c ->
+                                    if (mediaAppId != null) {
+                                        c.launchApp(mediaAppId)
+                                    } else {
+                                        runCatching { c.launchApp("com.webos.app.mediadiscovery") }
+                                            .onFailure { c.launchApp("com.webos.app.photovideo") }
+                                    }
+                                }
                             },
                             modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(12.dp),
